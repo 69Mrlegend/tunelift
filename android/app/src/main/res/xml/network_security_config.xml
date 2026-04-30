@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<network-security-config>
+    <!-- Default: block cleartext. Keep TuneLift hosted on HTTPS for best security. -->
+    <base-config cleartextTrafficPermitted="false" />
+</network-security-config>
+

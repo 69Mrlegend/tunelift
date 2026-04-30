@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">TuneLift</string>
+
+    <!-- Hosted TuneLift URL (change this for your deployment) -->
+    <string name="tune_lift_url">https://YOUR_TUNELIFT_DOMAIN_HERE/</string>
+
+    <string name="retry">Retry</string>
+    <string name="download_description">Downloading from TuneLift</string>
+
+    <string name="error_title_offline">You’re offline</string>
+    <string name="error_body_offline">Connect to the internet and try again.</string>
+
+    <string name="error_title_connection">Can’t load TuneLift</string>
+    <string name="error_body_connection">Check your connection and try again.</string>
+</resources>
+

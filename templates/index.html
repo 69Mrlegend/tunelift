@@ -1,0 +1,189 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>YouTube to MP3 Converter</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/styles.css') }}?v=bulk-four-tabs">
+  </head>
+  <body>
+    <main class="page">
+      <section class="app-shell">
+        <header class="topbar" aria-label="Application header">
+          <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span>TuneLift</span>
+          </div>
+          <span class="quality-pill" data-quality-pill>320 kbps</span>
+        </header>
+
+        <div class="hero-grid">
+          <section class="cover-stage" aria-label="MP3 cover preview">
+            <div class="album-card">
+              <div class="album-art" data-preview-art>
+                <img src="" alt="" data-preview-image>
+                <div class="thumbnail-placeholder" data-preview-placeholder>
+                  <span></span>
+                </div>
+              </div>
+              <div class="track-meta">
+                <p class="track-title" data-preview-title>Paste a YouTube link</p>
+                <p class="track-artist" data-preview-artist>Video title and uploader will appear here</p>
+                <p class="track-status" data-preview-status>Ready to convert</p>
+              </div>
+            </div>
+
+            <div class="mini-player" aria-hidden="true">
+              <span></span>
+              <div>
+                <strong>Best audio</strong>
+                <p>yt-dlp + FFmpeg + Mutagen</p>
+              </div>
+            </div>
+          </section>
+
+          <section class="converter-panel">
+            <div class="copy">
+              <p class="eyebrow" data-mode-eyebrow>YouTube audio converter</p>
+              <h1 data-mode-title>Turn videos into polished MP3s.</h1>
+              <p class="lede" data-mode-copy>
+                Paste one YouTube video link and download a 320 kbps MP3 with clean music metadata.
+              </p>
+            </div>
+
+            {% with messages = get_flashed_messages() %}
+              {% if messages %}
+                <div class="alert" role="alert">
+                  {% for message in messages %}
+                    <p>{{ message }}</p>
+                  {% endfor %}
+                </div>
+              {% endif %}
+            {% endwith %}
+
+            <form method="post" class="converter-form" data-converter-form>
+              {# Four tabs: mp3 | mp4 | spotify | bulk — same markup pattern for JS [data-format-option] #}
+              <fieldset class="format-picker" aria-label="Download format tabs">
+                <label>
+                  <input id="download-type-mp3" type="radio" name="download_type" value="mp3" checked data-format-option>
+                  <span>MP3 Audio</span>
+                </label>
+                <label>
+                  <input id="download-type-mp4" type="radio" name="download_type" value="mp4" data-format-option>
+                  <span>MP4 Video</span>
+                </label>
+                <label>
+                  <input id="download-type-spotify" type="radio" name="download_type" value="spotify" data-format-option>
+                  <span>Spotify Music</span>
+                </label>
+                <label>
+                  <input id="download-type-bulk" type="radio" name="download_type" value="bulk" data-format-option>
+                  <span>Bulk Downloader</span>
+                </label>
+              </fieldset>
+
+              <div class="quality-row" data-quality-row hidden>
+                <label for="quality">Video quality</label>
+                <select id="quality" name="quality" data-quality-select>
+                  <option value="360">360p</option>
+                  <option value="720" selected>720p</option>
+                  <option value="1080">1080p</option>
+                </select>
+              </div>
+
+              <label for="url" data-url-label data-url-control>YouTube video URL</label>
+              <div class="field-group" data-url-control>
+                <input
+                  id="url"
+                  name="url"
+                  type="url"
+                  value="{{ url or '' }}"
+                  placeholder="https://www.youtube.com/watch?v=..."
+                  autocomplete="off"
+                  required
+                  data-url-input
+                >
+                <button type="submit" data-submit-button>
+                  <span data-button-text>Convert</span>
+                  <span class="spinner" aria-hidden="true"></span>
+                </button>
+              </div>
+              <div class="bulk-row" data-bulk-row hidden>
+                <label for="bulk_songs">Song names</label>
+                <textarea
+                  id="bulk_songs"
+                  name="bulk_songs"
+                  rows="8"
+                  placeholder="Apna Bana Le&#10;Kesariya&#10;Tum Hi Ho&#10;Husn&#10;Perfect"
+                  data-bulk-songs
+                ></textarea>
+                <label class="file-drop" for="bulk_file">
+                  <span>Upload .txt file</span>
+                  <small>One song name per line</small>
+                  <input id="bulk_file" name="bulk_file" type="file" accept=".txt,text/plain" data-bulk-file>
+                </label>
+                <button type="submit" data-bulk-submit-button>
+                  <span>Start Bulk Download</span>
+                </button>
+              </div>
+              <p class="hint" data-status-text>Downloads audio, converts at 320 kbps, then embeds cover art.</p>
+              <div class="playlist-progress" data-playlist-progress hidden>
+                <div>
+                  <strong data-playlist-name>Spotify Playlist</strong>
+                  <span data-playlist-count>0 songs</span>
+                </div>
+                <p data-playlist-message>Preparing playlist</p>
+                <progress value="0" max="100" data-playlist-bar></progress>
+              </div>
+
+              <section class="playlist-panel" data-playlist-panel hidden aria-label="Download queue details">
+                <header class="playlist-panel__header">
+                  <div class="playlist-panel__cover">
+                    <img src="" alt="" data-playlist-cover-image>
+                    <div class="playlist-panel__cover-fallback" aria-hidden="true"></div>
+                  </div>
+                  <div class="playlist-panel__meta">
+                    <p class="playlist-panel__title" data-playlist-title>Spotify Playlist</p>
+                    <p class="playlist-panel__subtitle" data-playlist-subtitle>0 songs</p>
+                    <div class="playlist-panel__progress-row" data-playlist-progress-row hidden>
+                      <progress value="0" max="100" data-playlist-progress-bar></progress>
+                      <span class="playlist-panel__percent" data-playlist-percent>0%</span>
+                    </div>
+                    <p class="playlist-panel__progress-text" data-playlist-progress-text hidden>Preparing playlist</p>
+                  </div>
+                </header>
+
+                <ol class="playlist-panel__tracks" data-playlist-tracks></ol>
+                <div class="playlist-panel__done" data-playlist-done hidden>
+                  <p>Download Complete</p>
+                  <a href="#" data-playlist-download-link>Download ZIP</a>
+                </div>
+              </section>
+            </form>
+
+            <div class="details" aria-label="Conversion features">
+              <div>
+                <span>01</span>
+                <p data-feature-one>Best available audio</p>
+              </div>
+              <div>
+                <span>02</span>
+                <p data-feature-two>320 kbps MP3</p>
+              </div>
+              <div>
+                <span>03</span>
+                <p data-feature-three>Cover and tags</p>
+              </div>
+            </div>
+
+            <p class="notice">
+              Only download videos you own, have permission to use, or that are legally available for this purpose.
+            </p>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    <script src="{{ url_for('static', filename='js/app.js') }}?v=bulk-ui"></script>
+  </body>
+</html>

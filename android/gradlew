@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+
+#
+# Gradle wrapper script for Unix-like systems.
+#
+# NOTE: The wrapper JAR (gradle/wrapper/gradle-wrapper.jar) is normally committed.
+# If it is missing, open this project in Android Studio and use
+# "Sync Project with Gradle Files" to regenerate / download the wrapper.
+#
+
+set -eu
+
+APP_HOME="$(cd "$(dirname "$0")" && pwd -P)"
+
+CLASSPATH="$APP_HOME/gradle/wrapper/gradle-wrapper.jar"
+
+if [ -n "${JAVA_HOME:-}" ] && [ -x "$JAVA_HOME/bin/java" ]; then
+  JAVA_EXE="$JAVA_HOME/bin/java"
+else
+  JAVA_EXE="java"
+fi
+
+exec "$JAVA_EXE" ${JAVA_OPTS:-} ${GRADLE_OPTS:-} -Dorg.gradle.appname=gradlew -classpath "$CLASSPATH" org.gradle.wrapper.GradleWrapperMain "$@"
+
