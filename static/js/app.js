@@ -41,12 +41,53 @@ const playlistDownloadLink = document.querySelector("[data-playlist-download-lin
 const bulkRow = document.querySelector("[data-bulk-row]");
 const bulkSongs = document.querySelector("[data-bulk-songs]");
 const bulkFile = document.querySelector("[data-bulk-file]");
+const playlistActions = document.querySelector("[data-playlist-actions]");
+const jobStopButton = document.querySelector("[data-job-stop-button]");
+const playlistDoneText = document.querySelector("[data-playlist-done-text]");
+const confirmedYoutubeUrl = document.querySelector("[data-confirmed-youtube-url]");
+const matchConfirmation = document.querySelector("[data-match-confirmation]");
+const searchAgainButton = document.querySelector("[data-search-again-button]");
 
 let previewTimer;
 let previewController;
 let playlistDetailsController;
 let lastPlaylistDetailsUrl = "";
 let preparedPlaylistJobId = "";
+let activeBulkJobId = "";
+let activeVideoJobId = "";
+let rejectedMatchUrls = [];
+
+if (jobStopButton) {
+  jobStopButton.addEventListener("click", async () => {
+    const jobId = getSelectedFormat() === "bulk" ? activeBulkJobId : preparedPlaylistJobId;
+    if (!jobId) return;
+
+    jobStopButton.disabled = true;
+    jobStopButton.textContent = "Stopping...";
+    
+    const endpoint = getSelectedFormat() === "bulk" ? `/bulk/stop/${jobId}` : `/spotify-playlist/stop/${jobId}`;
+    try {
+      await fetch(endpoint, { method: "POST" });
+    } catch (e) {
+      // ignore
+    }
+  });
+}
+
+if (searchAgainButton) {
+  searchAgainButton.addEventListener("click", async () => {
+    const currentMatch = confirmedYoutubeUrl ? confirmedYoutubeUrl.value : "";
+    if (currentMatch) {
+      rejectedMatchUrls.push(currentMatch);
+    }
+    clearConfirmedMatch();
+    searchAgainButton.disabled = true;
+    searchAgainButton.textContent = "Searching again...";
+    await updatePreview(input.value.trim());
+    searchAgainButton.disabled = false;
+    searchAgainButton.textContent = "Wrong Match → Search Again";
+  });
+}
 
 if (form) {
   form.addEventListener("submit", async (event) => {
@@ -54,15 +95,26 @@ if (form) {
     const selectedFormat = getSelectedFormat();
     const formData = new FormData(form);
 
+    if (selectedFormat === "spotify" && !isSpotifyPlaylist(input.value.trim()) && !formData.get("confirmed_youtube_url")) {
+      showConversionError("Confirm the matched song before downloading.");
+      await updatePreview(input.value.trim());
+      return;
+    }
+
     form.classList.add("is-loading");
     setSubmitButtonsDisabled(true);
     input.readOnly = true;
-    buttonText.textContent = selectedFormat === "mp4" ? "Downloading" : "Converting";
+    buttonText.textContent = selectedFormat === "mp4" || selectedFormat === "ipod" ? "Downloading" : "Converting";
     statusText.textContent = getLoadingStatus();
 
     try {
       if (selectedFormat === "bulk") {
         await startBulkDownload(formData);
+        return;
+      }
+
+      if (selectedFormat === "mp4" || selectedFormat === "ipod") {
+        await startVideoDownload(formData, selectedFormat);
         return;
       }
 
@@ -104,6 +156,8 @@ if (formatOptions.length) {
 if (input) {
   input.addEventListener("input", () => {
     window.clearTimeout(previewTimer);
+    rejectedMatchUrls = [];
+    clearConfirmedMatch();
 
     const url = input.value.trim();
     if (!url) {
@@ -128,6 +182,16 @@ if (bulkFile) {
   bulkFile.addEventListener("change", handleBulkFileChange);
 }
 
+// Helper: does the current input look like a raw YouTube/Spotify URL?
+function isDirectUrl(text) {
+  try {
+    const u = new URL(text);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 async function updatePreview(url) {
   if (isSpotifyPlaylist(url)) {
     setPreviewLoading();
@@ -141,8 +205,24 @@ async function updatePreview(url) {
 
   previewController = new AbortController();
 
+  // For plain MP3 mode, allow song name queries (not just URLs)
+  const selectedFormat = getSelectedFormat();
+  const isSearch = selectedFormat === "mp3" && !isDirectUrl(url);
+
+  // Show loading state for search queries
+  if (isSearch) {
+    setPreviewLoading();
+    previewStatus.textContent = "Searching YouTube...";
+  }
+
   try {
-    const response = await fetch(`/preview?url=${encodeURIComponent(url)}&download_type=${getSelectedFormat()}`, {
+    const params = new URLSearchParams({
+      url,
+      download_type: selectedFormat,
+    });
+    rejectedMatchUrls.forEach((matchUrl) => params.append("exclude", matchUrl));
+
+    const response = await fetch(`/preview?${params.toString()}`, {
       signal: previewController.signal,
     });
     const data = await response.json();
@@ -153,7 +233,31 @@ async function updatePreview(url) {
       return;
     }
 
-    setPreviewData(data.video);
+    const video = data.source_track
+      ? {
+          ...data.video,
+          title: data.source_track.title || data.video.title,
+          artist: data.source_track.artist || data.video.artist,
+          matchedTitle: data.video.title,
+          matchedChannel: data.video.channel || data.video.artist,
+        }
+      : data.video;
+
+    setPreviewData(video);
+    if (getSelectedFormat() === "spotify" && data.video && data.video.url && !isSpotifyPlaylist(url)) {
+      setConfirmedMatch(data.video.url);
+    } else {
+      clearConfirmedMatch();
+    }
+
+    // Show "Search Again" button for best-possible matches in MP3 mode
+    if (matchConfirmation) {
+      if (isSearch && video.match_quality === "best_possible") {
+        matchConfirmation.hidden = false;
+      } else {
+        matchConfirmation.hidden = true;
+      }
+    }
 
     hidePlaylistPanel();
   } catch (error) {
@@ -165,6 +269,7 @@ async function updatePreview(url) {
 }
 
 function resetPreview() {
+  clearConfirmedMatch();
   const selectedFormat = getSelectedFormat();
   previewArt.classList.remove("has-image", "is-loading", "has-error");
   previewImage.removeAttribute("src");
@@ -195,7 +300,9 @@ function resetAfterConversionStarts() {
   input.readOnly = false;
   input.disabled = getSelectedFormat() === "bulk";
   input.value = "";
-  buttonText.textContent = "Convert";
+  rejectedMatchUrls = [];
+  clearConfirmedMatch();
+  buttonText.textContent = getSubmitButtonText();
   statusText.textContent = getDefaultStatus();
   playlistProgress.hidden = true;
   hidePlaylistPanel();
@@ -334,7 +441,141 @@ async function startBulkDownload(formData) {
   });
   resetBulkInputsOnly();
 
+  activeBulkJobId = startData.job_id;
   await pollBulkProgress(startData.job_id);
+}
+
+async function startVideoDownload(formData, mode = "mp4") {
+  const isIpod = mode === "ipod";
+  const startResponse = await fetch(isIpod ? "/ipod/start" : "/video/start", {
+    method: "POST",
+    body: formData,
+  });
+  const startData = await safeReadJson(startResponse);
+
+  if (!startResponse.ok || !startData.ok) {
+    showConversionError(startData.message || (isIpod ? "Could not start iPod MP4 download." : "Could not start video download."));
+    return;
+  }
+
+  const title = previewTitle.textContent && !previewArt.classList.contains("has-error")
+    ? previewTitle.textContent
+    : isIpod ? "iPod MP4 Video" : "MP4 Video";
+  const thumbnail = previewImage.getAttribute("src") || "";
+
+  playlistProgress.hidden = true;
+  playlistPanel.hidden = false;
+  if (playlistDone) {
+    playlistDone.hidden = true;
+  }
+  if (playlistActions) {
+    playlistActions.hidden = true;
+  }
+  if (playlistDownloadLink) {
+    playlistDownloadLink.textContent = isIpod ? "Download MP4 for iPod" : "Download MP4";
+    playlistDownloadLink.removeAttribute("href");
+  }
+
+  setPlaylistHeader({
+    name: title,
+    thumbnail,
+    total: 1,
+  });
+  if (playlistSubtitle) {
+    playlistSubtitle.textContent = isIpod ? "iPod Nano MP4 · 480x320" : `MP4 up to ${qualitySelect.value}p`;
+  }
+  renderPlaylistTracks([
+    {
+      title,
+      artist: isIpod ? "H.264 video · AAC audio · 480x320" : `MP4 video up to ${qualitySelect.value}p`,
+      thumbnail,
+      status: "Queued",
+    },
+  ], 1);
+  setPlaylistProgressUi({ current: 0, total: 100, message: isIpod ? "Downloading video..." : "Preparing video download" });
+
+  activeVideoJobId = startData.job_id;
+  await pollVideoProgress(startData.job_id, mode);
+}
+
+async function pollVideoProgress(jobId, mode = "mp4") {
+  const isIpod = mode === "ipod";
+  const response = await fetch(isIpod ? `/ipod/progress/${jobId}` : `/video/progress/${jobId}`);
+  const data = await safeReadJson(response);
+
+  if (!response.ok || !data.ok) {
+    showConversionError(data.message || (isIpod ? "Could not read iPod MP4 progress." : "Could not read video progress."));
+    return;
+  }
+
+  updateVideoProgress(data, mode);
+
+  if (data.status === "complete") {
+    if (playlistDone) {
+      playlistDone.hidden = false;
+    }
+    if (playlistDoneText) {
+      playlistDoneText.textContent = isIpod ? "Ready for iPod" : "MP4 download ready";
+    }
+    if (playlistDownloadLink) {
+      playlistDownloadLink.href = data.download_url;
+      playlistDownloadLink.textContent = isIpod ? "Download MP4 for iPod" : "Download MP4";
+    }
+    statusText.textContent = isIpod ? "Ready for iPod" : "MP4 download ready";
+    resetAfterPlaylistDownloadStarts();
+    return;
+  }
+
+  if (data.status === "error") {
+    showConversionError(data.error || (isIpod ? "iPod MP4 conversion failed." : "Video download failed."));
+    return;
+  }
+
+  window.setTimeout(() => pollVideoProgress(jobId, mode), 1200);
+}
+
+function updateVideoProgress(data, mode = "mp4") {
+  const isIpod = mode === "ipod";
+  const percent = Number.isFinite(Number(data.percent)) ? Number(data.percent) : 0;
+  const title = data.video_title || (isIpod ? "iPod MP4 Video" : "MP4 Video");
+  const thumbnail = previewImage.getAttribute("src") || "";
+  const statusLabel = data.status_label || data.message || (isIpod ? "Downloading video..." : "Downloading video");
+  const progressLines = [
+    isIpod ? `Downloading video: ${Math.round(percent)}%` : `Downloading Video: ${Math.round(percent)}%`,
+    `Speed: ${data.speed || "Calculating..."}`,
+    `ETA: ${data.eta || "Calculating..."}`,
+    `Status: ${statusLabel}`,
+  ];
+
+  playlistPanel.hidden = false;
+  setPlaylistHeader({
+    name: title,
+    thumbnail,
+    total: 1,
+  });
+  if (playlistSubtitle) {
+    const sizeText = data.total_size ? ` · ${data.total_size}` : "";
+    playlistSubtitle.textContent = isIpod ? `iPod Nano MP4 · 480x320${sizeText}` : `MP4 up to ${data.quality || qualitySelect.value}p${sizeText}`;
+  }
+  setPlaylistProgressUi({ current: percent, total: 100, message: progressLines.join("\n") });
+  if (playlistProgressText) {
+    playlistProgressText.innerHTML = progressLines.map(escapeHtml).join("<br>");
+  }
+  renderPlaylistTracks([
+    {
+      title,
+      artist: data.downloaded && data.total_size
+        ? `${data.downloaded} of ${data.total_size}`
+        : isIpod ? "H.264 video · AAC audio · 480x320" : `MP4 video up to ${data.quality || qualitySelect.value}p`,
+      thumbnail,
+      status: statusLabel,
+    },
+  ], data.status === "complete" ? null : 1);
+  if (playlistActions) {
+    playlistActions.hidden = true;
+  }
+
+  statusText.textContent = data.message || statusLabel;
 }
 
 async function pollBulkProgress(jobId) {
@@ -352,10 +593,16 @@ async function pollBulkProgress(jobId) {
     if (playlistDone) {
       playlistDone.hidden = false;
     }
+    if (playlistDoneText) {
+      playlistDoneText.textContent = data.message || "Download Complete";
+    }
+    if (playlistActions) {
+      playlistActions.hidden = true;
+    }
     if (playlistDownloadLink) {
       playlistDownloadLink.href = data.download_url;
     }
-    statusText.textContent = "Download Complete";
+    statusText.textContent = data.message || "Download Complete";
     resetAfterPlaylistDownloadStarts();
     return;
   }
@@ -383,10 +630,16 @@ async function pollPlaylistProgress(jobId) {
     if (playlistDone) {
       playlistDone.hidden = false;
     }
+    if (playlistDoneText) {
+      playlistDoneText.textContent = data.message || "Download Complete";
+    }
+    if (playlistActions) {
+      playlistActions.hidden = true;
+    }
     if (playlistDownloadLink) {
       playlistDownloadLink.href = data.download_url;
     }
-    statusText.textContent = "Download Complete";
+    statusText.textContent = data.message || "Download Complete";
     resetAfterPlaylistDownloadStarts();
     return;
   }
@@ -413,6 +666,9 @@ function updatePlaylistProgress(data) {
     });
     setPlaylistProgressUi({ current, total, message });
     renderPlaylistTracks(data.tracks || [], data.active_index);
+    if (playlistActions) {
+      playlistActions.hidden = false;
+    }
   } else {
     playlistProgress.hidden = false;
     playlistName.textContent = displayName;
@@ -438,7 +694,7 @@ function resetAfterPlaylistDownloadStarts() {
   setSubmitButtonsDisabled(false);
   input.readOnly = false;
   input.disabled = getSelectedFormat() === "bulk";
-  buttonText.textContent = "Convert";
+  buttonText.textContent = getSubmitButtonText();
   statusText.textContent = "Download Complete";
   playlistProgress.hidden = true;
   if (playlistProgressRow) {
@@ -462,7 +718,15 @@ function getDownloadName(response) {
     return regularMatch[1];
   }
 
-  return getSelectedFormat() === "mp4" ? "youtube-video.mp4" : "youtube-audio.mp3";
+  if (getSelectedFormat() === "mp4") {
+    return "youtube-video.mp4";
+  }
+
+  if (getSelectedFormat() === "ipod") {
+    return "youtube-video-ipod.mp4";
+  }
+
+  return "youtube-audio.mp3";
 }
 
 async function getErrorMessage(response) {
@@ -478,7 +742,7 @@ function showConversionError(message) {
   setSubmitButtonsDisabled(false);
   input.readOnly = false;
   input.disabled = getSelectedFormat() === "bulk";
-  buttonText.textContent = "Convert";
+  buttonText.textContent = getSubmitButtonText();
   statusText.textContent = message;
   playlistProgress.hidden = true;
   hidePlaylistPanel();
@@ -487,19 +751,32 @@ function showConversionError(message) {
 function updateFormatControls() {
   const selectedFormat = getSelectedFormat();
   const isVideo = selectedFormat === "mp4";
+  const isIpod = selectedFormat === "ipod";
   const isSpotify = selectedFormat === "spotify";
   const isBulk = selectedFormat === "bulk";
+  const isMyPlaylists = selectedFormat === "my-playlists";
 
   qualityRow.hidden = !isVideo;
   if (bulkRow) {
     bulkRow.hidden = !isBulk;
   }
+  
+  const myPlaylistsPanel = document.querySelector("[data-my-playlists-panel]");
+  if (myPlaylistsPanel) {
+    myPlaylistsPanel.hidden = !isMyPlaylists;
+    if (isMyPlaylists && document.querySelector("[data-playlist-grid]") && !window.hasLoadedPlaylists) {
+      loadUserPlaylists();
+      window.hasLoadedPlaylists = true;
+    }
+  }
+
   urlControls.forEach((control) => {
-    control.hidden = isBulk;
+    control.hidden = isBulk || isMyPlaylists;
   });
-  input.required = !isBulk;
-  input.disabled = isBulk;
+  input.required = !isBulk && !isMyPlaylists;
+  input.disabled = isBulk || isMyPlaylists;
   qualityPill.textContent = getQualityPillText();
+  buttonText.textContent = getSubmitButtonText();
   modeEyebrow.textContent = getModeEyebrow();
   modeTitle.textContent = getModeTitle();
   modeCopy.textContent = getModeCopy();
@@ -532,12 +809,20 @@ function getDefaultStatus() {
     return `Downloads a clean MP4 video at up to ${qualitySelect.value}p.`;
   }
 
+  if (selectedFormat === "ipod") {
+    return "Downloads and converts a YouTube video into an iPod Nano compatible MP4.";
+  }
+
   if (selectedFormat === "spotify") {
     return "Fetches Spotify song or playlist info, finds audio on YouTube, then embeds metadata.";
   }
 
   if (selectedFormat === "bulk") {
     return "Paste song names or upload a .txt file to build one tagged MP3 ZIP.";
+  }
+
+  if (selectedFormat === "my-playlists") {
+    return "Select a playlist to download it.";
   }
 
   return "Downloads audio, converts at 320 kbps, then embeds cover art.";
@@ -548,6 +833,10 @@ function getLoadingStatus() {
 
   if (selectedFormat === "mp4") {
     return `Downloading MP4 video at up to ${qualitySelect.value}p...`;
+  }
+
+  if (selectedFormat === "ipod") {
+    return "Downloading video and converting for iPod...";
   }
 
   if (selectedFormat === "spotify") {
@@ -570,6 +859,10 @@ function getQualityPillText() {
     return `MP4 ${qualitySelect.value}p`;
   }
 
+  if (selectedFormat === "ipod") {
+    return "iPod MP4";
+  }
+
   if (selectedFormat === "spotify") {
     return "Spotify MP3";
   }
@@ -578,7 +871,29 @@ function getQualityPillText() {
     return "Bulk ZIP";
   }
 
+  if (selectedFormat === "my-playlists") {
+    return "My Playlists";
+  }
+
   return "320 kbps";
+}
+
+function getSubmitButtonText() {
+  const selectedFormat = getSelectedFormat();
+
+  if (selectedFormat === "ipod") {
+    return "Download MP4 for iPod";
+  }
+
+  if (selectedFormat === "mp4") {
+    return "Download MP4";
+  }
+
+  if (selectedFormat === "spotify") {
+    return "Download Spotify MP3";
+  }
+
+  return "Download MP3";
 }
 
 function getModeEyebrow() {
@@ -588,12 +903,20 @@ function getModeEyebrow() {
     return "YouTube video downloader";
   }
 
+  if (selectedFormat === "ipod") {
+    return "iPod video converter";
+  }
+
   if (selectedFormat === "spotify") {
     return "Spotify music downloader";
   }
 
   if (selectedFormat === "bulk") {
     return "Bulk song downloader";
+  }
+
+  if (selectedFormat === "my-playlists") {
+    return "Spotify library";
   }
 
   return "YouTube audio converter";
@@ -606,12 +929,20 @@ function getModeTitle() {
     return "Download clean MP4 videos.";
   }
 
+  if (selectedFormat === "ipod") {
+    return "Download MP4 videos for iPod.";
+  }
+
   if (selectedFormat === "spotify") {
     return "Turn Spotify links into tagged MP3s.";
   }
 
   if (selectedFormat === "bulk") {
     return "Download whole song lists.";
+  }
+
+  if (selectedFormat === "my-playlists") {
+    return "Download your personal playlists.";
   }
 
   return "Turn videos into polished MP3s.";
@@ -624,12 +955,20 @@ function getModeCopy() {
     return "Paste one YouTube video link and download an MP4 file at your selected quality.";
   }
 
+  if (selectedFormat === "ipod") {
+    return "Paste one YouTube video link and TuneLift will create a compact 480x320 MP4 for iPod Nano.";
+  }
+
   if (selectedFormat === "spotify") {
     return "Paste a Spotify track or playlist link, fetch song details, match each track on YouTube, and download tagged MP3s.";
   }
 
   if (selectedFormat === "bulk") {
     return "Paste many song names or upload a text file. TuneLift searches YouTube, creates tagged MP3s, and packages them into one ZIP.";
+  }
+
+  if (selectedFormat === "my-playlists") {
+    return "View your Spotify library and download full playlists directly inside TuneLift.";
   }
 
   return "Paste one YouTube video link and download a 320 kbps MP3 with clean music metadata.";
@@ -642,12 +981,20 @@ function getFeatureText(index) {
     return ["Clean MP4 video", `${qualitySelect.value}p quality`, "Audio included"][index - 1];
   }
 
+  if (selectedFormat === "ipod") {
+    return ["480x320 MP4", "H.264 + AAC", "iPod Nano ready"][index - 1];
+  }
+
   if (selectedFormat === "spotify") {
     return ["Spotify metadata", "YouTube audio match", "ZIP for playlists"][index - 1];
   }
 
   if (selectedFormat === "bulk") {
     return ["Line-by-line queue", "320 kbps MP3", "ZIP download"][index - 1];
+  }
+
+  if (selectedFormat === "my-playlists") {
+    return ["Full library sync", "320 kbps MP3", "ZIP for playlists"][index - 1];
   }
 
   return ["Best available audio", "320 kbps MP3", "Cover and tags"][index - 1];
@@ -665,9 +1012,34 @@ function setPreviewData(video) {
   previewArt.classList.remove("is-loading", "has-error");
   previewTitle.textContent = video.title || "Untitled video";
   previewArtist.textContent = video.artist || "Unknown uploader";
-  previewStatus.textContent = "Ready to convert";
+
+  // Match quality badge
+  const quality = video.match_quality;
+  previewStatus.classList.remove("status--exact", "status--good", "status--best-possible");
+  if (quality === "exact") {
+    previewStatus.textContent = video.duration_text
+      ? `✓ Exact match · ${video.duration_text}`
+      : "✓ Exact match";
+    previewStatus.classList.add("status--exact");
+  } else if (quality === "good") {
+    previewStatus.textContent = video.duration_text
+      ? `✓ Good match · ${video.duration_text}`
+      : "✓ Good match";
+    previewStatus.classList.add("status--good");
+  } else if (quality === "best_possible") {
+    previewStatus.textContent = video.duration_text
+      ? `⚠ Best possible match · ${video.duration_text}`
+      : "⚠ Best possible match found";
+    previewStatus.classList.add("status--best-possible");
+  } else {
+    previewStatus.textContent = video.duration_text
+      ? `Duration ${video.duration_text} · Ready to download`
+      : "Ready to convert";
+  }
+
   if (video.kind === "playlist") {
     previewStatus.textContent = `${video.total} songs ready`;
+    previewStatus.classList.remove("status--exact", "status--good", "status--best-possible");
   }
 
   if (video.thumbnail) {
@@ -680,6 +1052,30 @@ function setPreviewData(video) {
     previewImage.alt = "";
     previewArt.classList.remove("has-image");
     previewPlaceholder.hidden = false;
+  }
+}
+
+function setConfirmedMatch(url) {
+  if (confirmedYoutubeUrl) {
+    confirmedYoutubeUrl.value = url || "";
+  }
+  if (matchConfirmation) {
+    matchConfirmation.hidden = !url;
+  }
+  if (buttonText && getSelectedFormat() === "spotify") {
+    buttonText.textContent = url ? "Correct Song → Download" : getSubmitButtonText();
+  }
+}
+
+function clearConfirmedMatch() {
+  if (confirmedYoutubeUrl) {
+    confirmedYoutubeUrl.value = "";
+  }
+  if (matchConfirmation) {
+    matchConfirmation.hidden = true;
+  }
+  if (buttonText) {
+    buttonText.textContent = getSubmitButtonText();
   }
 }
 
@@ -702,6 +1098,7 @@ function isSpotifyPlaylist(url) {
 }
 
 function setPreviewError(message) {
+  clearConfirmedMatch();
   previewArt.classList.remove("is-loading", "has-image");
   previewArt.classList.add("has-error");
   previewImage.removeAttribute("src");
@@ -872,12 +1269,14 @@ function applyTrackState(tracks, activeIndex) {
 
     row.classList.toggle("is-active", Boolean(activeIndex) && index + 1 === activeIndex);
     row.classList.toggle("is-complete", normalized === "completed");
+    row.classList.toggle("is-error", normalized === "not-found" || normalized === "failed");
 
     if (statusNode) {
       statusNode.textContent = track.status || "Pending";
       statusNode.classList.toggle("is-pending", normalized === "pending");
       statusNode.classList.toggle("is-downloading", normalized === "downloading");
       statusNode.classList.toggle("is-completed", normalized === "completed");
+      statusNode.classList.toggle("is-error", normalized === "not-found" || normalized === "failed");
     }
   });
 }
@@ -909,6 +1308,12 @@ function normalizeStatus(status) {
   }
   if (value.includes("complete")) {
     return "completed";
+  }
+  if (value.includes("not found") || value.includes("not-found")) {
+    return "not-found";
+  }
+  if (value.includes("fail")) {
+    return "failed";
   }
   return "pending";
 }
@@ -949,6 +1354,14 @@ function hidePlaylistPanel() {
   }
   if (playlistDownloadLink) {
     playlistDownloadLink.removeAttribute("href");
+    playlistDownloadLink.textContent = "Download ZIP";
+  }
+  if (playlistActions) {
+    playlistActions.hidden = true;
+  }
+  if (jobStopButton) {
+    jobStopButton.disabled = false;
+    jobStopButton.textContent = "Stop & Download";
   }
   if (playlistProgressRow) {
     playlistProgressRow.hidden = true;

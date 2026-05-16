@@ -1,4 +1,4 @@
-MAX_BULK_SONGS = 100
+MAX_BULK_SONGS = 200
 
 
 class BulkInputError(Exception):

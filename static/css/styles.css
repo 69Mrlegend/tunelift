@@ -266,6 +266,40 @@ body {
   box-shadow: 0 0 14px rgba(30, 215, 96, 0.7);
 }
 
+/* Match quality badge variants */
+.track-status.status--exact {
+  background: rgba(30, 215, 96, 0.15);
+  color: #c8f7d8;
+  border: 1px solid rgba(30, 215, 96, 0.35);
+}
+
+.track-status.status--exact::before {
+  background: #1ed760;
+  box-shadow: 0 0 14px rgba(30, 215, 96, 0.8);
+}
+
+.track-status.status--good {
+  background: rgba(58, 134, 255, 0.13);
+  color: #cfe3ff;
+  border: 1px solid rgba(58, 134, 255, 0.32);
+}
+
+.track-status.status--good::before {
+  background: #3a86ff;
+  box-shadow: 0 0 12px rgba(58, 134, 255, 0.7);
+}
+
+.track-status.status--best-possible {
+  background: rgba(255, 183, 77, 0.13);
+  color: #ffe0a0;
+  border: 1px solid rgba(255, 183, 77, 0.35);
+}
+
+.track-status.status--best-possible::before {
+  background: #ffb74d;
+  box-shadow: 0 0 12px rgba(255, 183, 77, 0.7);
+}
+
 .mini-player {
   display: grid;
   grid-template-columns: 46px minmax(0, 1fr);
@@ -337,11 +371,11 @@ h1 {
   font-weight: 800;
 }
 
-/* Tabs: four equal columns — avoid minmax(…px) so the row never forces horizontal
+/* Tabs: compact equal columns — avoid minmax(…px) so the row never forces horizontal
    overflow + clipping under .app-shell { overflow: hidden }. */
 .format-picker {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 6px;
   margin: 0 0 4px;
   padding: 4px;
@@ -851,6 +885,27 @@ button:disabled {
   line-height: 1.5;
 }
 
+.match-confirmation {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.match-confirmation[hidden] {
+  display: none;
+}
+
+.btn-secondary {
+  min-height: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #f8fafc;
+  padding: 0 18px;
+}
+
+.btn-secondary:hover {
+  background: rgba(255, 255, 255, 0.1);
+}
+
 .alert {
   margin: 0 0 18px;
   border: 1px solid rgba(255, 95, 87, 0.28);
@@ -972,28 +1027,157 @@ button:disabled {
   }
 }
 
+.my-playlists-panel {
+  display: grid;
+  gap: 16px;
+}
 
+.my-playlists-panel[hidden] {
+  display: none;
+}
 
+.spotify-login-prompt {
+  text-align: center;
+  padding: 40px 20px;
+  background: rgba(30, 215, 96, 0.04);
+  border: 1px dashed rgba(30, 215, 96, 0.2);
+  border-radius: 16px;
+}
 
+.spotify-login-prompt h3 {
+  color: #1ed760;
+  margin: 0 0 10px;
+  font-size: 1.4rem;
+}
 
+.spotify-login-prompt p {
+  color: #a7a7a7;
+  margin: 0 0 20px;
+  line-height: 1.5;
+}
 
+.btn-spotify {
+  display: inline-block;
+  background: #1ed760;
+  color: #000;
+  text-decoration: none;
+  font-weight: 900;
+  padding: 14px 28px;
+  border-radius: 999px;
+  transition: transform 160ms ease, background 160ms ease;
+}
 
+.btn-spotify:hover {
+  background: #24e56a;
+  transform: translateY(-2px);
+}
 
+.playlist-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 16px;
+  max-height: 400px;
+  overflow-y: auto;
+  padding-right: 8px;
+  scrollbar-gutter: stable;
+}
 
+.playlist-grid-loading, .playlist-grid-error, .playlist-grid-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: #a7a7a7;
+  padding: 30px 10px;
+}
 
+.playlist-card {
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 12px;
+  padding: 12px;
+  transition: transform 200ms ease, background 200ms ease;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
 
+.playlist-card:hover {
+  background: rgba(255, 255, 255, 0.08);
+  transform: translateY(-2px);
+}
 
+.playlist-card-cover {
+  width: 100%;
+  aspect-ratio: 1;
+  border-radius: 8px;
+  overflow: hidden;
+  position: relative;
+  background: rgba(0, 0, 0, 0.2);
+}
 
+.playlist-card-cover img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
 
+.playlist-card-fallback {
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, rgba(30, 215, 96, 0.2), rgba(58, 134, 255, 0.2));
+}
 
+.playlist-card-overlay {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  opacity: 0;
+  transition: opacity 200ms ease;
+}
 
+.playlist-card:hover .playlist-card-overlay {
+  opacity: 1;
+}
 
+.btn-download-playlist {
+  background: #1ed760;
+  color: #000;
+  border: none;
+  border-radius: 999px;
+  padding: 8px 16px;
+  font-weight: 900;
+  font-size: 0.8rem;
+  cursor: pointer;
+  min-height: unset;
+  transition: transform 160ms ease;
+}
 
+.btn-download-playlist:hover {
+  transform: scale(1.05);
+}
 
+.playlist-card-info {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
 
+.playlist-card-info h4 {
+  margin: 0;
+  color: #fff;
+  font-size: 0.95rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
-
-
-
-
-
+.playlist-card-info p {
+  margin: 0;
+  color: #a7a7a7;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

@@ -62,15 +62,20 @@
             {% endwith %}
 
             <form method="post" class="converter-form" data-converter-form>
-              {# Four tabs: mp3 | mp4 | spotify | bulk — same markup pattern for JS [data-format-option] #}
+              <input type="hidden" name="confirmed_youtube_url" value="" data-confirmed-youtube-url>
+              {# Format tabs use the same markup pattern for JS [data-format-option]. #}
               <fieldset class="format-picker" aria-label="Download format tabs">
                 <label>
                   <input id="download-type-mp3" type="radio" name="download_type" value="mp3" checked data-format-option>
-                  <span>MP3 Audio</span>
+                  <span>Download MP3</span>
                 </label>
                 <label>
                   <input id="download-type-mp4" type="radio" name="download_type" value="mp4" data-format-option>
                   <span>MP4 Video</span>
+                </label>
+                <label>
+                  <input id="download-type-ipod" type="radio" name="download_type" value="ipod" data-format-option>
+                  <span>Download MP4 for iPod</span>
                 </label>
                 <label>
                   <input id="download-type-spotify" type="radio" name="download_type" value="spotify" data-format-option>
@@ -79,6 +84,10 @@
                 <label>
                   <input id="download-type-bulk" type="radio" name="download_type" value="bulk" data-format-option>
                   <span>Bulk Downloader</span>
+                </label>
+                <label>
+                  <input id="download-type-my-playlists" type="radio" name="download_type" value="my-playlists" data-format-option>
+                  <span>My Playlists</span>
                 </label>
               </fieldset>
 
@@ -96,15 +105,14 @@
                 <input
                   id="url"
                   name="url"
-                  type="url"
+                  type="text"
                   value="{{ url or '' }}"
                   placeholder="https://www.youtube.com/watch?v=..."
                   autocomplete="off"
-                  required
                   data-url-input
                 >
                 <button type="submit" data-submit-button>
-                  <span data-button-text>Convert</span>
+                  <span data-button-text>Download MP3</span>
                   <span class="spinner" aria-hidden="true"></span>
                 </button>
               </div>
@@ -126,7 +134,24 @@
                   <span>Start Bulk Download</span>
                 </button>
               </div>
+
+              <div class="my-playlists-panel" data-my-playlists-panel hidden>
+                {% if logged_in_spotify %}
+                  <div class="playlist-grid" data-playlist-grid>
+                    <p class="playlist-grid-loading">Loading your playlists...</p>
+                  </div>
+                {% else %}
+                  <div class="spotify-login-prompt">
+                    <h3>Connect to Spotify</h3>
+                    <p>Log in to view and download your personal playlists directly in TuneLift.</p>
+                    <a href="{{ url_for('spotify_login') }}" class="btn-spotify">Login with Spotify</a>
+                  </div>
+                {% endif %}
+              </div>
               <p class="hint" data-status-text>Downloads audio, converts at 320 kbps, then embeds cover art.</p>
+              <div class="match-confirmation" data-match-confirmation hidden>
+                <button type="button" class="btn-secondary" data-search-again-button>Wrong Match → Search Again</button>
+              </div>
               <div class="playlist-progress" data-playlist-progress hidden>
                 <div>
                   <strong data-playlist-name>Spotify Playlist</strong>
@@ -154,8 +179,13 @@
                 </header>
 
                 <ol class="playlist-panel__tracks" data-playlist-tracks></ol>
+                
+                <div class="playlist-panel__actions" data-playlist-actions hidden>
+                  <button type="button" class="btn btn-stop" data-job-stop-button>Stop & Download</button>
+                </div>
+                
                 <div class="playlist-panel__done" data-playlist-done hidden>
-                  <p>Download Complete</p>
+                  <p data-playlist-done-text>Download Complete</p>
                   <a href="#" data-playlist-download-link>Download ZIP</a>
                 </div>
               </section>

@@ -5,20 +5,33 @@ import uuid
 import logging
 from pathlib import Path
 
-from flask import Flask, after_this_request, flash, jsonify, render_template, request, send_file
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
+
+load_dotenv()
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
+from flask import Flask, after_this_request, flash, jsonify, render_template, request, send_file, session, redirect, url_for
 
 from converter import (
     ConversionError,
     convert_bulk_songs_to_zip,
+    convert_search_to_mp3,
     convert_spotify_playlist_to_zip,
     convert_spotify_to_mp3,
+    convert_youtube_to_ipod_mp4,
     convert_youtube_to_mp3,
     convert_youtube_to_mp4,
     validate_youtube_url,
 )
 from utils.bulk import BulkInputError, bulk_tracks_response, parse_song_names
 from utils.converter import get_ffmpeg_path
-from utils.downloader import DownloadFailed, get_video_preview
+from utils.downloader import DownloadFailed, get_search_preview, get_video_preview
 from utils.spotify import (
     SpotifyError,
     get_spotify_playlist_info,
@@ -27,6 +40,9 @@ from utils.spotify import (
     get_spotify_url_type,
     is_spotify_url,
     normalize_spotify_url,
+    get_spotify_auth_url,
+    exchange_spotify_code,
+    get_user_playlists,
 )
 
 
@@ -36,6 +52,12 @@ DOWNLOAD_DIR.mkdir(exist_ok=True)
 VIDEO_QUALITIES = {"360", "720", "1080"}
 PLAYLIST_JOBS = {}
 BULK_JOBS = {}
+VIDEO_JOBS = {}
+IPOD_JOBS = {}
+FFMPEG_MISSING_MESSAGE = (
+    "FFmpeg is required. Install it at C:\\ffmpeg\\bin\\ffmpeg.exe, "
+    "place it in tools/ffmpeg/bin, or add ffmpeg.exe to PATH."
+)
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-change-me")
@@ -78,10 +100,58 @@ def summarize_for_log(value, limit=1200):
     return text
 
 
+@app.route("/spotify/login")
+def spotify_login():
+    redirect_uri = SPOTIFY_REDIRECT_URI or "http://127.0.0.1:5000/callback"
+    try:
+        url = get_spotify_auth_url(redirect_uri)
+        return redirect(url)
+    except SpotifyError as exc:
+        flash(str(exc))
+        return redirect(url_for("index"))
+
+
+@app.route("/callback")
+def spotify_callback():
+    code = request.args.get("code")
+    if not code:
+        flash("Spotify login failed or was canceled.")
+        return redirect(url_for("index"))
+        
+    redirect_uri = SPOTIFY_REDIRECT_URI or "http://127.0.0.1:5000/callback"
+    try:
+        token = exchange_spotify_code(code, redirect_uri)
+        session["spotify_token"] = token
+    except SpotifyError as exc:
+        flash(str(exc))
+        
+    return redirect(url_for("index"))
+
+
+@app.route("/spotify/logout")
+def spotify_logout():
+    session.pop("spotify_token", None)
+    return redirect(url_for("index"))
+
+
+@app.get("/api/spotify/playlists")
+def api_spotify_playlists():
+    token = session.get("spotify_token")
+    if not token:
+        return jsonify({"ok": False, "message": "Not logged in"}), 401
+        
+    try:
+        playlists = get_user_playlists(token)
+        return jsonify({"ok": True, "playlists": playlists})
+    except SpotifyError as exc:
+        return jsonify({"ok": False, "message": str(exc)}), 400
+
+
 @app.route("/", methods=["GET", "POST"])
 def index():
+    logged_in_spotify = "spotify_token" in session
     if request.method == "GET":
-        return render_template("index.html")
+        return render_template("index.html", logged_in_spotify=logged_in_spotify)
 
     url = request.form.get("url", "").strip()
     download_type = request.form.get("download_type", "mp3")
@@ -89,41 +159,64 @@ def index():
 
     if not url:
         flash("Paste a link first.")
-        return render_template("index.html", url=url), 400
+        return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
 
     if download_type == "spotify":
         if not is_spotify_url(url):
             flash("Please paste a valid Spotify track or playlist link.")
-            return render_template("index.html", url=url), 400
+            return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
         if get_spotify_url_type(url) == "playlist":
             flash("Playlist downloads run in the progress panel. Please use the Spotify playlist flow.")
-            return render_template("index.html", url=url), 400
+            return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
+    elif download_type == "mp3":
+        is_valid_url, _ = validate_youtube_url(url)
+        # Plain song names are allowed for MP3 mode — the search path handles them.
+        # mp4/ipod modes still require a direct YouTube URL.
     else:
         is_valid_url, error_message = validate_youtube_url(url)
         if not is_valid_url:
             flash(error_message)
-            return render_template("index.html", url=url), 400
+            return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
 
     if get_ffmpeg_path() is None:
-        flash("FFmpeg is required. Install FFmpeg or place it in tools/ffmpeg/bin.")
-        return render_template("index.html", url=url), 500
+        flash(FFMPEG_MISSING_MESSAGE)
+        return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 500
 
     try:
         if download_type == "spotify":
-            result = convert_spotify_to_mp3(url, DOWNLOAD_DIR)
+            confirmed_youtube_url = request.form.get("confirmed_youtube_url", "").strip()
+            if confirmed_youtube_url:
+                is_valid_url, error_message = validate_youtube_url(confirmed_youtube_url)
+                if not is_valid_url:
+                    flash(error_message)
+                    return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
+            result = convert_spotify_to_mp3(url, DOWNLOAD_DIR, youtube_url=confirmed_youtube_url or None)
             mimetype = "audio/mpeg"
         elif download_type == "mp4":
             if quality not in VIDEO_QUALITIES:
                 flash("Please choose a valid video quality.")
-                return render_template("index.html", url=url), 400
+                return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
             result = convert_youtube_to_mp4(url, DOWNLOAD_DIR, quality)
             mimetype = "video/mp4"
+        elif download_type == "ipod":
+            result = convert_youtube_to_ipod_mp4(url, DOWNLOAD_DIR)
+            mimetype = "video/mp4"
         else:
-            result = convert_youtube_to_mp3(url, DOWNLOAD_DIR)
+            # MP3 mode: direct YouTube URL or song name search.
+            # These are mutually exclusive paths — a direct URL NEVER triggers
+            # the search logic, and a plain text query NEVER triggers direct download.
+            is_yt_url, _ = validate_youtube_url(url)
+            if is_yt_url:
+                app.logger.info("mp3.download mode=direct_url url=%r", url)
+                result = convert_youtube_to_mp3(url, DOWNLOAD_DIR)
+            else:
+                app.logger.info("mp3.download mode=search query=%r", url)
+                result = convert_search_to_mp3(url, DOWNLOAD_DIR)
             mimetype = "audio/mpeg"
+
     except ConversionError as exc:
         flash(str(exc))
-        return render_template("index.html", url=url), 400
+        return render_template("index.html", url=url, logged_in_spotify=logged_in_spotify), 400
 
     @after_this_request
     def cleanup(response):
@@ -160,18 +253,417 @@ def preview():
                     }
                 )
 
-            return jsonify({"ok": True, "video": get_spotify_track_info(url)})
+            track = get_spotify_track_info(url)
+            excluded = request.args.getlist("exclude")
+            match = get_search_preview(track["search_query"], track_info=track, exclude_urls=excluded)
+            return jsonify({"ok": True, "video": match, "source_track": track})
         except SpotifyError as exc:
+            return jsonify({"ok": False, "message": str(exc)}), 400
+        except DownloadFailed as exc:
             return jsonify({"ok": False, "message": str(exc)}), 400
 
     is_valid_url, error_message = validate_youtube_url(url)
     if not is_valid_url:
+        # Not a YouTube URL — treat as a search query for plain MP3 mode
+        if download_type in ("mp3",):
+            try:
+                match = get_search_preview(url)
+                return jsonify({"ok": True, "video": match})
+            except DownloadFailed as exc:
+                return jsonify({"ok": False, "message": str(exc)}), 400
         return jsonify({"ok": False, "message": error_message}), 400
 
     try:
-        return jsonify({"ok": True, "video": get_video_preview(url)})
+        video = get_video_preview(url)
+        # Direct YouTube URLs are always an exact match
+        video["match_quality"] = "exact"
+        video["is_audiobook_hint"] = False
+        return jsonify({"ok": True, "video": video})
     except DownloadFailed as exc:
         return jsonify({"ok": False, "message": str(exc)}), 400
+
+
+@app.post("/video/start")
+def start_video_download():
+    try:
+        url = request.form.get("url", "").strip()
+        quality = request.form.get("quality", "720")
+
+        is_valid_url, error_message = validate_youtube_url(url)
+        if not is_valid_url:
+            return api_json({"ok": False, "message": error_message}, 400, "video.start")
+
+        if quality not in VIDEO_QUALITIES:
+            return api_json({"ok": False, "message": "Please choose a valid video quality."}, 400, "video.start")
+
+        if get_ffmpeg_path() is None:
+            return api_json(
+                {"ok": False, "message": FFMPEG_MISSING_MESSAGE},
+                500,
+                "video.start",
+            )
+
+        job_id = uuid.uuid4().hex
+        VIDEO_JOBS[job_id] = build_video_job(url, quality)
+
+        thread = threading.Thread(target=run_video_job, args=(job_id,), daemon=True)
+        thread.start()
+
+        return api_json({"ok": True, "job_id": job_id}, context="video.start")
+    except Exception as exc:
+        app.logger.exception("video.start unexpected_exception")
+        return api_json({"ok": False, "message": f"Unexpected video start error: {exc}"}, 500, "video.start")
+
+
+@app.get("/video/progress/<job_id>")
+def video_progress(job_id):
+    try:
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            return api_json({"ok": False, "message": "Video download job not found."}, 404, "video.progress")
+
+        return api_json(
+            {
+                "ok": True,
+                "status": job["status"],
+                "video_title": job["video_title"],
+                "quality": job["quality"],
+                "percent": job["percent"],
+                "speed": job["speed"],
+                "eta": job["eta"],
+                "status_label": job["status_label"],
+                "message": job["message"],
+                "download_url": job["download_url"],
+                "error": job["error"],
+                "downloaded": job["downloaded"],
+                "total_size": job["total_size"],
+            },
+            context="video.progress",
+        )
+    except Exception as exc:
+        app.logger.exception("video.progress unexpected_exception job_id=%r", job_id)
+        return api_json({"ok": False, "message": f"Unexpected video progress error: {exc}"}, 500, "video.progress")
+
+
+@app.get("/video/download/<job_id>")
+def download_video_file(job_id):
+    job = VIDEO_JOBS.get(job_id)
+    if not job or job.get("status") != "complete" or job.get("result") is None:
+        return jsonify({"ok": False, "message": "MP4 video is not ready yet."}), 404
+
+    result = job["result"]
+
+    @after_this_request
+    def cleanup(response):
+        response.call_on_close(lambda: cleanup_video_job(job_id))
+        return response
+
+    return send_file(
+        result.file_path,
+        as_attachment=True,
+        download_name=result.download_name,
+        mimetype="video/mp4",
+    )
+
+
+@app.post("/ipod/start")
+def start_ipod_download():
+    try:
+        url = request.form.get("url", "").strip()
+
+        is_valid_url, error_message = validate_youtube_url(url)
+        if not is_valid_url:
+            return api_json({"ok": False, "message": error_message}, 400, "ipod.start")
+
+        if get_ffmpeg_path() is None:
+            return api_json(
+                {"ok": False, "message": FFMPEG_MISSING_MESSAGE},
+                500,
+                "ipod.start",
+            )
+
+        job_id = uuid.uuid4().hex
+        IPOD_JOBS[job_id] = build_video_job(url, "iPod 480x320")
+
+        thread = threading.Thread(target=run_ipod_job, args=(job_id,), daemon=True)
+        thread.start()
+
+        return api_json({"ok": True, "job_id": job_id}, context="ipod.start")
+    except Exception as exc:
+        app.logger.exception("ipod.start unexpected_exception")
+        return api_json({"ok": False, "message": f"Unexpected iPod MP4 start error: {exc}"}, 500, "ipod.start")
+
+
+@app.get("/ipod/progress/<job_id>")
+def ipod_progress(job_id):
+    try:
+        job = IPOD_JOBS.get(job_id)
+        if not job:
+            return api_json({"ok": False, "message": "iPod MP4 job not found."}, 404, "ipod.progress")
+
+        return api_json(
+            {
+                "ok": True,
+                "status": job["status"],
+                "video_title": job["video_title"],
+                "quality": job["quality"],
+                "percent": job["percent"],
+                "speed": job["speed"],
+                "eta": job["eta"],
+                "status_label": job["status_label"],
+                "message": job["message"],
+                "download_url": job["download_url"],
+                "error": job["error"],
+                "downloaded": job["downloaded"],
+                "total_size": job["total_size"],
+            },
+            context="ipod.progress",
+        )
+    except Exception as exc:
+        app.logger.exception("ipod.progress unexpected_exception job_id=%r", job_id)
+        return api_json({"ok": False, "message": f"Unexpected iPod MP4 progress error: {exc}"}, 500, "ipod.progress")
+
+
+@app.get("/ipod/download/<job_id>")
+def download_ipod_file(job_id):
+    job = IPOD_JOBS.get(job_id)
+    if not job or job.get("status") != "complete" or job.get("result") is None:
+        return jsonify({"ok": False, "message": "iPod MP4 is not ready yet."}), 404
+
+    result = job["result"]
+
+    @after_this_request
+    def cleanup(response):
+        response.call_on_close(lambda: cleanup_ipod_job(job_id))
+        return response
+
+    return send_file(
+        result.file_path,
+        as_attachment=True,
+        download_name=result.download_name,
+        mimetype="video/mp4",
+    )
+
+
+def build_video_job(url, quality):
+    return {
+        "status": "queued",
+        "url": url,
+        "quality": quality,
+        "video_title": "YouTube Video",
+        "percent": 0,
+        "speed": "",
+        "eta": "",
+        "status_label": "Queued",
+        "message": "Video download queued",
+        "download_url": "",
+        "error": "",
+        "downloaded": "",
+        "total_size": "",
+        "result": None,
+    }
+
+
+def run_video_job(job_id):
+    def update_progress(progress):
+        job = VIDEO_JOBS.get(job_id)
+        if not job:
+            return
+
+        info = progress.get("info_dict") or {}
+        if info.get("title"):
+            job["video_title"] = info["title"]
+
+        percent = progress.get("percent")
+        if percent is not None:
+            job["percent"] = round(percent, 1)
+
+        if progress.get("speed") is not None:
+            job["speed"] = format_speed(progress.get("speed"))
+
+        if progress.get("eta") is not None:
+            job["eta"] = format_eta(progress.get("eta"))
+
+        if progress.get("downloaded_bytes") is not None:
+            job["downloaded"] = format_bytes(progress.get("downloaded_bytes"))
+
+        if progress.get("total_bytes") is not None:
+            job["total_size"] = format_bytes(progress.get("total_bytes"))
+
+        status = progress.get("status") or "downloading"
+        if status == "fallback":
+            job["status"] = "running"
+            job["status_label"] = "Trying fallback format"
+        elif status == "processing":
+            job["status"] = "processing"
+            job["status_label"] = "Processing audio/video merge"
+        elif status == "starting":
+            job["status"] = "running"
+            job["status_label"] = "Selecting stable format"
+        elif status != "error":
+            job["status"] = "running"
+            job["status_label"] = "Downloading video"
+
+        job["message"] = progress.get("message") or job["status_label"]
+
+    try:
+        job = VIDEO_JOBS[job_id]
+        job["status"] = "running"
+        job["status_label"] = "Starting download"
+        job["message"] = "Starting MP4 download"
+
+        result = convert_youtube_to_mp4(job["url"], DOWNLOAD_DIR, job["quality"], progress_callback=update_progress)
+        job = VIDEO_JOBS[job_id]
+        job["status"] = "complete"
+        job["percent"] = 100
+        job["speed"] = ""
+        job["eta"] = "0 seconds"
+        job["status_label"] = "Ready to download"
+        job["message"] = "Download complete"
+        job["download_url"] = f"/video/download/{job_id}"
+        job["result"] = result
+    except ConversionError as exc:
+        app.logger.exception("video.job conversion_error job_id=%r", job_id)
+        job = VIDEO_JOBS[job_id]
+        job["status"] = "error"
+        job["error"] = str(exc)
+        job["message"] = str(exc)
+        job["status_label"] = "Failed"
+    except Exception as exc:
+        app.logger.exception("video.job unexpected_exception job_id=%r", job_id)
+        job = VIDEO_JOBS[job_id]
+        job["status"] = "error"
+        job["error"] = f"Video download failed: {exc}"
+        job["message"] = job["error"]
+        job["status_label"] = "Failed"
+
+
+def run_ipod_job(job_id):
+    def update_progress(progress):
+        job = IPOD_JOBS.get(job_id)
+        if not job:
+            return
+
+        info = progress.get("info_dict") or {}
+        if info.get("title"):
+            job["video_title"] = info["title"]
+
+        percent = progress.get("percent")
+        if percent is not None:
+            job["percent"] = round(percent, 1)
+
+        if progress.get("speed") is not None:
+            job["speed"] = format_speed(progress.get("speed"))
+
+        if progress.get("eta") is not None:
+            job["eta"] = format_eta(progress.get("eta"))
+
+        if progress.get("downloaded_bytes") is not None:
+            job["downloaded"] = format_bytes(progress.get("downloaded_bytes"))
+
+        if progress.get("total_bytes") is not None:
+            job["total_size"] = format_bytes(progress.get("total_bytes"))
+
+        status = progress.get("status") or "downloading"
+        if status == "processing":
+            job["status"] = "processing"
+            job["status_label"] = progress.get("message") or "Converting for iPod..."
+        elif status == "complete":
+            job["status"] = "processing"
+            job["status_label"] = "Ready for iPod"
+        elif status == "starting":
+            job["status"] = "running"
+            job["status_label"] = "Downloading video..."
+        elif status == "fallback":
+            job["status"] = "running"
+            job["status_label"] = "Trying fallback format"
+        elif status != "error":
+            job["status"] = "running"
+            job["status_label"] = "Downloading video..."
+
+        job["message"] = progress.get("message") or job["status_label"]
+
+    try:
+        job = IPOD_JOBS[job_id]
+        job["status"] = "running"
+        job["status_label"] = "Downloading video..."
+        job["message"] = "Downloading video..."
+
+        result = convert_youtube_to_ipod_mp4(job["url"], DOWNLOAD_DIR, progress_callback=update_progress)
+        job = IPOD_JOBS[job_id]
+        job["status"] = "complete"
+        job["percent"] = 100
+        job["speed"] = ""
+        job["eta"] = "0 seconds"
+        job["status_label"] = "Ready for iPod"
+        job["message"] = "Ready for iPod"
+        job["download_url"] = f"/ipod/download/{job_id}"
+        job["result"] = result
+    except ConversionError as exc:
+        app.logger.exception("ipod.job conversion_error job_id=%r", job_id)
+        job = IPOD_JOBS[job_id]
+        job["status"] = "error"
+        job["error"] = str(exc)
+        job["message"] = str(exc)
+        job["status_label"] = "Failed"
+    except Exception as exc:
+        app.logger.exception("ipod.job unexpected_exception job_id=%r", job_id)
+        job = IPOD_JOBS[job_id]
+        job["status"] = "error"
+        job["error"] = f"iPod MP4 conversion failed: {exc}"
+        job["message"] = job["error"]
+        job["status_label"] = "Failed"
+
+
+def cleanup_video_job(job_id):
+    job = VIDEO_JOBS.pop(job_id, None)
+    if job and job.get("result"):
+        shutil.rmtree(job["result"].work_dir, ignore_errors=True)
+
+
+def cleanup_ipod_job(job_id):
+    job = IPOD_JOBS.pop(job_id, None)
+    if job and job.get("result"):
+        shutil.rmtree(job["result"].work_dir, ignore_errors=True)
+
+
+def format_speed(bytes_per_second):
+    if not bytes_per_second:
+        return ""
+    return f"{format_bytes(bytes_per_second)}/s"
+
+
+def format_bytes(byte_count):
+    if byte_count is None:
+        return ""
+
+    value = float(byte_count)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+
+    return f"{value:.1f} TB"
+
+
+def format_eta(seconds):
+    if seconds is None:
+        return ""
+
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} seconds"
+
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        if remaining_seconds:
+            return f"{minutes} min {remaining_seconds} sec"
+        return f"{minutes} minutes"
+
+    hours, remaining_minutes = divmod(minutes, 60)
+    if remaining_minutes:
+        return f"{hours} hr {remaining_minutes} min"
+    return f"{hours} hours"
 
 
 @app.post("/spotify-playlist/start")
@@ -206,7 +698,7 @@ def start_spotify_playlist():
 
         if get_ffmpeg_path() is None:
             return playlist_json(
-                {"ok": False, "message": "FFmpeg is required. Install FFmpeg or place it in tools/ffmpeg/bin."},
+                {"ok": False, "message": FFMPEG_MISSING_MESSAGE},
                 500,
                 "spotify-playlist.start",
             )
@@ -250,6 +742,16 @@ def spotify_playlist_progress(job_id):
         return playlist_json({"ok": False, "message": f"Unexpected playlist progress error: {exc}"}, 500, "spotify-playlist.progress")
 
 
+@app.post("/spotify-playlist/stop/<job_id>")
+def stop_spotify_playlist(job_id):
+    job = PLAYLIST_JOBS.get(job_id)
+    if not job:
+        return playlist_json({"ok": False, "message": "Job not found."}, 404, "spotify-playlist.stop")
+    job["stop_requested"] = True
+    job["message"] = "Stopping... Finishing current song."
+    return playlist_json({"ok": True}, context="spotify-playlist.stop")
+
+
 @app.get("/spotify-playlist/download/<job_id>")
 def download_spotify_playlist(job_id):
     job = PLAYLIST_JOBS.get(job_id)
@@ -272,8 +774,11 @@ def download_spotify_playlist(job_id):
 
 
 def run_spotify_playlist_job(job_id):
-    def update_progress(playlist_name, total, current, message):
+    def update_progress(playlist_name, total, current, message, track_status=None):
         job = PLAYLIST_JOBS[job_id]
+        if job.get("stop_requested"):
+            return False
+            
         job["playlist_name"] = playlist_name
         job["total"] = total
         job["current"] = current
@@ -282,13 +787,21 @@ def run_spotify_playlist_job(job_id):
         if current:
             job["active_index"] = current
             tracks = job.get("tracks") or []
+            
+            if track_status:
+                tracks[current - 1]["status"] = track_status
+                
             for index, track in enumerate(tracks, start=1):
                 if index < current:
-                    track["status"] = "Completed"
+                    if track.get("status") not in ["Failed", "Not Found"]:
+                        track["status"] = "Completed"
                 elif index == current:
-                    track["status"] = "Downloading"
+                    if not track_status:
+                        track["status"] = "Downloading"
                 else:
-                    track["status"] = "Pending"
+                    if track.get("status") not in ["Failed", "Not Found"]:
+                        track["status"] = "Pending"
+        return True
 
     try:
         job = PLAYLIST_JOBS[job_id]
@@ -296,12 +809,22 @@ def run_spotify_playlist_job(job_id):
         result = convert_spotify_playlist_to_zip(job["url"], DOWNLOAD_DIR, progress_callback=update_progress, playlist=playlist)
         job = PLAYLIST_JOBS[job_id]
         job["status"] = "complete"
-        job["message"] = "Playlist ZIP is ready"
         job["download_url"] = f"/spotify-playlist/download/{job_id}"
         job["result"] = result
+        
         tracks = job.get("tracks") or []
         for track in tracks:
-            track["status"] = "Completed"
+            if track.get("status") == "Downloading":
+                track["status"] = "Completed"
+                
+        completed = sum(1 for t in tracks if t.get("status") == "Completed")
+        failed = sum(1 for t in tracks if t.get("status") in ["Failed", "Not Found"])
+        
+        if failed > 0:
+            job["message"] = f"Completed: {completed} | Not Found: {failed}"
+        else:
+            job["message"] = f"Completed: {completed}"
+            
         job["active_index"] = None
     except ConversionError as exc:
         job = PLAYLIST_JOBS[job_id]
@@ -323,7 +846,8 @@ def spotify_playlist_details():
             return playlist_json({"ok": False, "message": "Please paste a valid Spotify playlist link."}, 400, "spotify-playlist.details")
 
         try:
-            playlist = get_spotify_playlist_info(normalized)
+            token = session.get("spotify_token")
+            playlist = get_spotify_playlist_info(normalized, token)
         except SpotifyError as exc:
             app.logger.exception("spotify-playlist.details SpotifyError")
             return playlist_json({"ok": False, "message": str(exc)}, 400, "spotify-playlist.details")
@@ -379,7 +903,8 @@ def prepare_spotify_playlist():
             return playlist_json({"ok": False, "message": str(exc)}, 400, "spotify-playlist.prepare")
 
         try:
-            playlist = get_spotify_playlist_info(normalized)
+            token = session.get("spotify_token")
+            playlist = get_spotify_playlist_info(normalized, token)
         except SpotifyError as exc:
             app.logger.exception("spotify-playlist.prepare 400 at=get_spotify_playlist_info")
             return playlist_json({"ok": False, "message": str(exc)}, 400, "spotify-playlist.prepare")
@@ -479,7 +1004,7 @@ def start_bulk_download():
 
         if get_ffmpeg_path() is None:
             return api_json(
-                {"ok": False, "message": "FFmpeg is required. Install FFmpeg or place it in tools/ffmpeg/bin."},
+                {"ok": False, "message": FFMPEG_MISSING_MESSAGE},
                 500,
                 "bulk.start",
             )
@@ -530,6 +1055,16 @@ def bulk_progress(job_id):
         return api_json({"ok": False, "message": f"Unexpected bulk progress error: {exc}"}, 500, "bulk.progress")
 
 
+@app.post("/bulk/stop/<job_id>")
+def stop_bulk_download(job_id):
+    job = BULK_JOBS.get(job_id)
+    if not job:
+        return api_json({"ok": False, "message": "Job not found."}, 404, "bulk.stop")
+    job["stop_requested"] = True
+    job["message"] = "Stopping... Finishing current song."
+    return api_json({"ok": True}, context="bulk.stop")
+
+
 @app.get("/bulk/download/<job_id>")
 def download_bulk_zip(job_id):
     job = BULK_JOBS.get(job_id)
@@ -578,8 +1113,11 @@ def bulk_response(job):
 
 
 def run_bulk_job(job_id):
-    def update_progress(collection_name, total, current, message):
+    def update_progress(collection_name, total, current, message, track_status=None):
         job = BULK_JOBS[job_id]
+        if job.get("stop_requested"):
+            return False
+            
         job["collection_name"] = collection_name
         job["total"] = total
         job["current"] = current
@@ -588,24 +1126,43 @@ def run_bulk_job(job_id):
         if current:
             job["active_index"] = current
             tracks = job.get("tracks") or []
+            
+            if track_status:
+                tracks[current - 1]["status"] = track_status
+                
             for index, track in enumerate(tracks, start=1):
                 if index < current:
-                    track["status"] = "Completed"
+                    if track.get("status") not in ["Failed", "Not Found"]:
+                        track["status"] = "Completed"
                 elif index == current:
-                    track["status"] = "Downloading"
+                    if not track_status:
+                        track["status"] = "Downloading"
                 else:
-                    track["status"] = "Pending"
+                    if track.get("status") not in ["Failed", "Not Found"]:
+                        track["status"] = "Pending"
+        return True
 
     try:
         job = BULK_JOBS[job_id]
         result = convert_bulk_songs_to_zip(job["song_names"], DOWNLOAD_DIR, progress_callback=update_progress)
         job = BULK_JOBS[job_id]
         job["status"] = "complete"
-        job["message"] = "Bulk ZIP is ready"
         job["download_url"] = f"/bulk/download/{job_id}"
         job["result"] = result
-        for track in job.get("tracks") or []:
-            track["status"] = "Completed"
+        
+        tracks = job.get("tracks") or []
+        for track in tracks:
+            if track.get("status") == "Downloading":
+                track["status"] = "Completed"
+                
+        completed = sum(1 for t in tracks if t.get("status") == "Completed")
+        failed = sum(1 for t in tracks if t.get("status") in ["Failed", "Not Found"])
+        
+        if failed > 0:
+            job["message"] = f"Completed: {completed} | Not Found: {failed}"
+        else:
+            job["message"] = f"Completed: {completed}"
+            
         job["active_index"] = None
     except ConversionError as exc:
         app.logger.exception("bulk.job conversion_error job_id=%r", job_id)
@@ -629,3 +1186,4 @@ def cleanup_bulk_job(job_id):
 
 if __name__ == "__main__":
     app.run(debug=True)
+    

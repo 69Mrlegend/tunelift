@@ -6,14 +6,14 @@ from mutagen.id3 import APIC, ID3, TALB, TIT2, TPE1
 UNKNOWN_ARTIST = "Unknown Artist"
 
 
-def add_mp3_metadata(mp3_path, title, artist, cover_path=None):
+def add_mp3_metadata(mp3_path, title, artist, cover_path=None, album="YouTube"):
     """Add title, artist, album name, and album art to an MP3 file."""
     mp3_path = Path(mp3_path)
     tags = ID3()
 
     tags.add(TIT2(encoding=3, text=title))
     tags.add(TPE1(encoding=3, text=artist))
-    tags.add(TALB(encoding=3, text="YouTube"))
+    tags.add(TALB(encoding=3, text=album))
 
     if cover_path:
         add_album_art(tags, cover_path)
@@ -147,16 +147,31 @@ def remove_bracket_phrases(value):
         "lyric video",
         "audio",
         "visualizer",
+        "full video",
+        "remix",
+        "slowed",
+        "reverb",
+        "bass boosted",
+        "nightcore",
+        "4k",
+        "hd",
+        "official",
     ]
     text = value
 
     for phrase in phrases:
+        # Remove from brackets
         text = text.replace(f"({phrase})", "", 1)
         text = text.replace(f"[{phrase}]", "", 1)
         text = text.replace(f"({phrase.title()})", "", 1)
         text = text.replace(f"[{phrase.title()}]", "", 1)
+        text = text.replace(f"({phrase.upper()})", "", 1)
+        text = text.replace(f"[{phrase.upper()}]", "", 1)
+        
+        # Remove if just floating at the end (with or without dashes)
+        text = remove_suffixes(text, [f" {phrase}", f" - {phrase}", f" {phrase.title()}", f" - {phrase.title()}", f" {phrase.upper()}", f" - {phrase.upper()}"])
 
-    return text
+    return text.strip(" -|")
 
 
 def add_album_art(tags, cover_path):

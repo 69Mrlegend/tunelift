@@ -1,11 +1,24 @@
 import json
 import os
+import shutil
+import threading
+import uuid
 import logging
 from pathlib import Path
 from urllib.parse import quote, urlparse
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv():
+        return False
 
+load_dotenv()
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI")
 
 class SpotifyError(Exception):
     """Raised when Spotify track details cannot be loaded."""
@@ -117,11 +130,80 @@ def find_spotify_entity(path_parts):
     return None
 
 
+def get_spotify_track_details(url):
+    track_id = get_spotify_id(url, "track")
+    try:
+        token = get_spotify_access_token()
+    except SpotifyError:
+        return None
+        
+    track_url = f"https://api.spotify.com/v1/tracks/{track_id}"
+    track = spotify_api_get(track_url, token)
+    
+    title = track.get("name")
+    artists = ", ".join(artist.get("name", "") for artist in track.get("artists", []) if artist.get("name"))
+    
+    return {
+        "title": title,
+        "artist": artists,
+        "thumbnail": get_largest_image_url(track.get("album", {}).get("images") or []),
+        "search_query": build_search_query(title, artists),
+        "album_name": track.get("album", {}).get("name") or "YouTube",
+        "duration_ms": track.get("duration_ms"),
+    }
+
+
+def search_spotify_track(query):
+    """Search Spotify for a track and return its metadata."""
+    if not query:
+        return None
+        
+    try:
+        token = get_spotify_access_token()
+    except SpotifyError:
+        return None
+        
+    encoded_query = quote(query, safe="")
+    search_url = f"https://api.spotify.com/v1/search?q={encoded_query}&type=track&limit=1"
+    
+    try:
+        results = spotify_api_get(search_url, token)
+        tracks = results.get("tracks", {}).get("items", [])
+        if not tracks:
+            return None
+            
+        track = tracks[0]
+        title = track.get("name")
+        artists = ", ".join(artist.get("name", "") for artist in track.get("artists", []) if artist.get("name"))
+        
+        return {
+            "title": title,
+            "artist": artists,
+            "thumbnail": get_largest_image_url(track.get("album", {}).get("images") or []),
+            "search_query": build_search_query(title, artists),
+            "album_name": track.get("album", {}).get("name") or "YouTube",
+            "duration_ms": track.get("duration_ms"),
+        }
+    except Exception as exc:
+        logger.warning("Spotify search failed for query %r: %s", query, exc)
+        return None
+
+
 def get_spotify_track_info(url):
-    """Read public Spotify embed data without requiring API credentials."""
+    """Read public Spotify track details."""
     url = normalize_spotify_url(url)
     if not is_spotify_track_url(url):
         raise SpotifyError("Please paste a valid Spotify track link.")
+
+    # Try API first if credentials are set
+    if os.environ.get("SPOTIFY_CLIENT_ID") and os.environ.get("SPOTIFY_CLIENT_SECRET"):
+        try:
+            details = get_spotify_track_details(url)
+            if details:
+                return details
+        except Exception as exc:
+            logger.warning("Failed to fetch track details from Spotify API: %s", exc)
+            # Fall back to oembed
 
     endpoint = f"https://open.spotify.com/oembed?url={quote(url, safe='')}"
     request = Request(endpoint, headers={"User-Agent": "Mozilla/5.0"})
@@ -139,19 +221,21 @@ def get_spotify_track_info(url):
         "artist": artist,
         "thumbnail": data.get("thumbnail_url") or "",
         "search_query": build_search_query(title, artist),
+        "album_name": "YouTube",
+        "duration_ms": None,
     }
 
 
-def get_spotify_playlist_info(url):
+def get_spotify_playlist_info(url, access_token=None):
     """Read playlist name and tracks using the Spotify Web API."""
     url = normalize_spotify_url(url)
     playlist_id = get_spotify_id(url, "playlist")
     logger.info("spotify.playlist_info url=%r playlist_id=%r", url, playlist_id)
 
-    token = get_spotify_access_token()
+    token = access_token or get_spotify_access_token()
     playlist_url = (
         f"https://api.spotify.com/v1/playlists/{playlist_id}"
-        "?fields=name,images,tracks(total,items(track(name,artists(name),album(images))),next)"
+        "?fields=name,images,tracks(total,items(track(name,artists(name),album(images,name),duration_ms)),next)"
     )
     playlist = spotify_api_get(playlist_url, token)
 
@@ -183,8 +267,8 @@ def get_spotify_playlist_info(url):
 
 
 def get_spotify_access_token():
-    client_id = os.environ.get("SPOTIFY_CLIENT_ID")
-    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET")
+    client_id = SPOTIFY_CLIENT_ID or os.environ.get("SPOTIFY_CLIENT_ID")
+    client_secret = SPOTIFY_CLIENT_SECRET or os.environ.get("SPOTIFY_CLIENT_SECRET")
 
     if not client_id or not client_secret:
         logger.warning(
@@ -213,6 +297,66 @@ def get_spotify_access_token():
         raise SpotifyError("Could not authenticate with Spotify. Check your API credentials.") from exc
 
     return data["access_token"]
+
+
+def get_spotify_auth_url(redirect_uri):
+    client_id = SPOTIFY_CLIENT_ID or os.environ.get("SPOTIFY_CLIENT_ID")
+    if not client_id:
+        raise SpotifyError("Spotify login requires SPOTIFY_CLIENT_ID.")
+        
+    scope = quote("playlist-read-private playlist-read-collaborative")
+    redirect_uri_encoded = quote(redirect_uri)
+    url = f"https://accounts.spotify.com/authorize?client_id={client_id}&response_type=code&redirect_uri={redirect_uri_encoded}&scope={scope}"
+    return url
+
+
+def exchange_spotify_code(code, redirect_uri):
+    client_id = SPOTIFY_CLIENT_ID or os.environ.get("SPOTIFY_CLIENT_ID")
+    client_secret = SPOTIFY_CLIENT_SECRET or os.environ.get("SPOTIFY_CLIENT_SECRET")
+    
+    if not client_id or not client_secret:
+        raise SpotifyError("Spotify login requires SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET.")
+        
+    body = f"grant_type=authorization_code&code={quote(code)}&redirect_uri={quote(redirect_uri)}".encode("utf-8")
+    request = Request(
+        "https://accounts.spotify.com/api/token",
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    import base64
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
+    request.add_header("Authorization", f"Basic {credentials}")
+
+    try:
+        with urlopen(request, timeout=15) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:
+        raise SpotifyError("Could not authenticate with Spotify. Check your API credentials.") from exc
+
+    return data["access_token"]
+
+
+def get_user_playlists(access_token):
+    url = "https://api.spotify.com/v1/me/playlists?limit=50"
+    playlists = []
+    
+    while url:
+        page = spotify_api_get(url, access_token)
+        for item in page.get("items", []):
+            if not item:
+                continue
+            playlists.append({
+                "id": item.get("id"),
+                "name": item.get("name") or "Unnamed Playlist",
+                "thumbnail": get_largest_image_url(item.get("images") or []),
+                "total": item.get("tracks", {}).get("total", 0),
+                "owner": item.get("owner", {}).get("display_name", "Unknown"),
+                "url": item.get("external_urls", {}).get("spotify", "")
+            })
+        url = page.get("next")
+        
+    return playlists
 
 
 def spotify_api_get(url, token):
@@ -253,6 +397,8 @@ def parse_playlist_tracks(items):
                 "artist": artists,
                 "thumbnail": get_largest_image_url(track.get("album", {}).get("images") or []),
                 "search_query": build_search_query(title, artists),
+                "album_name": track.get("album", {}).get("name") or "YouTube",
+                "duration_ms": track.get("duration_ms"),
             }
         )
 
@@ -293,8 +439,8 @@ def cleanup_title(raw_title):
 
 def build_search_query(title, artist):
     if artist:
-        return f"{artist} {title} audio"
-    return f"{title} audio"
+        return f"{artist} {title} Official Audio"
+    return f"{title} Official Audio"
 
 
 def download_cover_image(image_url, output_folder):
