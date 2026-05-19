@@ -14,7 +14,10 @@
             <span class="brand-mark" aria-hidden="true"></span>
             <span>TuneLift</span>
           </div>
-          <span class="quality-pill" data-quality-pill>320 kbps</span>
+          <div class="topbar-actions">
+            <button type="button" class="icon-pill" data-open-player>Player</button>
+            <span class="quality-pill" data-quality-pill>320 kbps</span>
+          </div>
         </header>
 
         <div class="hero-grid">
@@ -68,6 +71,10 @@
                 <label>
                   <input id="download-type-mp3" type="radio" name="download_type" value="mp3" checked data-format-option>
                   <span>Download MP3</span>
+                </label>
+                <label>
+                  <input id="download-type-yt-playlist" type="radio" name="download_type" value="yt-playlist" data-format-option>
+                  <span>YouTube Playlist</span>
                 </label>
                 <label>
                   <input id="download-type-mp4" type="radio" name="download_type" value="mp4" data-format-option>
@@ -211,8 +218,127 @@
             </p>
           </section>
         </div>
+
+        <!-- Queue & History activity panel -->
+        <section id="queue-history-section" class="queue-history-section" data-queue-history-section>
+          <div class="qh-header">
+            <h2>Download Activity</h2>
+            <div class="qh-tabs">
+              <button type="button" class="qh-tab-btn active" data-qh-tab="queue">Active Queue (<span data-queue-count>0</span>)</button>
+              <button type="button" class="qh-tab-btn" data-qh-tab="history">Download History (<span data-history-count>0</span>)</button>
+            </div>
+          </div>
+          <div class="qh-toolbar">
+            <input type="search" data-history-search placeholder="Search downloads">
+            <button type="button" class="qh-btn qh-btn-pause" data-pause-queue>Pause Queue</button>
+            <button type="button" class="qh-btn qh-btn-download" data-resume-queue>Resume Queue</button>
+            <button type="button" class="qh-btn qh-btn-stop" data-clear-history>Clear History</button>
+          </div>
+
+          <!-- Active Queue list container -->
+          <div class="qh-content active" data-qh-content="queue">
+            <div class="qh-empty-state" data-queue-empty>
+              <div class="qh-empty-icon">📂</div>
+              <p>No active downloads. Paste a link above and download!</p>
+            </div>
+            <div class="qh-list" data-queue-list>
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+
+          <!-- Historical download history container -->
+          <div class="qh-content" data-qh-content="history">
+            <div class="qh-empty-state" data-history-empty>
+              <div class="qh-empty-icon">⏳</div>
+              <p>No download history yet.</p>
+            </div>
+            <div class="qh-list" data-history-list>
+              <!-- Dynamically populated -->
+            </div>
+          </div>
+        </section>
+
+        <section class="dashboard-grid" aria-label="TuneLift dashboard">
+          <article class="dashboard-panel">
+            <header>
+              <h2>Analytics</h2>
+              <button type="button" class="qh-btn qh-btn-download" data-refresh-analytics>Refresh</button>
+            </header>
+            <div class="metric-grid" data-analytics-cards></div>
+          </article>
+
+          <article class="dashboard-panel">
+            <header>
+              <h2>Storage</h2>
+              <button type="button" class="qh-btn qh-btn-stop" data-clean-storage>Clean Up</button>
+            </header>
+            <div class="storage-lines" data-storage-panel></div>
+          </article>
+
+          <article class="dashboard-panel">
+            <header>
+              <h2>Local Playlists</h2>
+              <button type="button" class="qh-btn qh-btn-download" data-create-local-playlist>Create</button>
+            </header>
+            <div class="local-playlist-builder">
+              <input type="text" data-local-playlist-name placeholder="Playlist name">
+              <select data-local-song-picker></select>
+            </div>
+            <div class="local-playlist-list" data-local-playlists></div>
+          </article>
+
+          <article id="settings" class="dashboard-panel">
+            <header>
+              <h2>Settings</h2>
+              <button type="button" class="qh-btn qh-btn-download" data-save-settings>Save</button>
+            </header>
+            <div class="settings-grid">
+              <label>Audio quality <select data-setting="audio_quality"><option value="128">128 kbps</option><option value="192">192 kbps</option><option value="320">320 kbps</option></select></label>
+              <label>Simultaneous downloads <input type="number" min="1" max="4" data-setting="simultaneous_downloads"></label>
+              <label>Download folder <input type="text" data-setting="download_folder"></label>
+              <label>ZIP compression <input type="range" min="0" max="9" data-setting="zip_compression_level"></label>
+              <label><input type="checkbox" data-setting="embed_metadata"> Embed metadata</label>
+              <label><input type="checkbox" data-setting="embed_cover_art"> Embed cover art</label>
+              <label><input type="checkbox" data-setting="wifi_only"> WiFi only</label>
+              <label><input type="checkbox" data-setting="auto_clear_cache"> Auto-clear cache</label>
+            </div>
+          </article>
+        </section>
       </section>
     </main>
+
+    <div class="toast-stack" data-toast-stack></div>
+
+    <aside class="player-drawer" data-player-drawer hidden>
+      <header>
+        <h2>Offline Player</h2>
+        <button type="button" class="qh-btn" data-close-player>Close</button>
+      </header>
+      <div class="player-cover" data-player-cover></div>
+      <p class="player-title" data-player-title>No song selected</p>
+      <input type="range" min="0" max="100" value="0" data-player-seek>
+      <div class="player-controls">
+        <button type="button" data-player-prev>Prev</button>
+        <button type="button" data-player-toggle>Play</button>
+        <button type="button" data-player-next>Next</button>
+        <button type="button" data-player-shuffle>Shuffle</button>
+        <button type="button" data-player-repeat>Repeat</button>
+      </div>
+      <ol class="player-library" data-player-library></ol>
+    </aside>
+
+    <div class="bottom-player" data-bottom-player hidden>
+      <button type="button" data-mini-toggle>Play</button>
+      <span data-mini-title>Ready</span>
+      <button type="button" data-mini-open>Open</button>
+    </div>
+
+    <nav class="mobile-nav" aria-label="Mobile navigation">
+      <a href="#url">Download</a>
+      <a href="#queue-history-section" data-mobile-queue-link>Queue</a>
+      <button type="button" data-mobile-player-link>Player</button>
+      <a href="#settings">Settings</a>
+    </nav>
 
     <script src="{{ url_for('static', filename='js/app.js') }}?v=bulk-ui"></script>
   </body>

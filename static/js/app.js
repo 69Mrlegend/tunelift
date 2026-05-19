@@ -123,22 +123,26 @@ if (form) {
         return;
       }
 
-      const conversionRequest = fetch(form.action || window.location.href, {
-        method: "POST",
-        body: formData,
-      });
-
-      resetAfterConversionStarts();
-
-      const response = await conversionRequest;
-      if (!response.ok) {
-        const message = await getErrorMessage(response);
-        showConversionError(message);
+      if (selectedFormat === "yt-playlist") {
+        await startYoutubePlaylistDownload(formData);
         return;
       }
 
-      const downloadBlob = await response.blob();
-      startBrowserDownload(downloadBlob, getDownloadName(response));
+      // Single MP3 or Single Spotify Track enqueuing:
+      const addResponse = await fetch("/api/queue/add", {
+        method: "POST",
+        body: formData,
+      });
+      const addData = await safeReadJson(addResponse);
+
+      if (!addResponse.ok || !addData.ok) {
+        showConversionError(addData.message || "Could not add task to the download queue.");
+        return;
+      }
+
+      // Track active single job for live progress updating
+      activeSingleJobId = addData.job_id;
+      resetAfterConversionStarts();
     } catch (error) {
       showConversionError("Something went wrong. Check the link and try again.");
     }
@@ -196,6 +200,12 @@ async function updatePreview(url) {
   if (isSpotifyPlaylist(url)) {
     setPreviewLoading();
     await loadPlaylistDetails(url);
+    return;
+  }
+
+  if (isYoutubePlaylist(url)) {
+    setPreviewLoading();
+    await loadYoutubePlaylistDetails(url);
     return;
   }
 
@@ -392,6 +402,41 @@ async function startPlaylistDownload(formData) {
 
   if (!startResponse.ok || !startData.ok) {
     showConversionError(startData.message || "Could not start playlist download.");
+    return;
+  }
+
+  playlistProgress.hidden = true;
+  playlistPanel.hidden = false;
+  if (playlistDone) {
+    playlistDone.hidden = true;
+  }
+  playlistProgressRow.hidden = false;
+  playlistProgressText.hidden = false;
+  setPlaylistProgressUi({ current: 0, total: getRenderedTrackCount(), message: "Preparing playlist" });
+
+  await pollPlaylistProgress(startData.job_id);
+}
+
+async function startYoutubePlaylistDownload(formData) {
+  const url = input.value.trim();
+  await loadYoutubePlaylistDetails(url);
+
+  if (!preparedPlaylistJobId) {
+    showConversionError("Load playlist details before starting the download.");
+    return;
+  }
+
+  const startFormData = new FormData();
+  startFormData.set("job_id", preparedPlaylistJobId);
+
+  const startResponse = await fetch("/api/youtube-playlist/start", {
+    method: "POST",
+    body: startFormData,
+  });
+  const startData = await safeReadJson(startResponse);
+
+  if (!startResponse.ok || !startData.ok) {
+    showConversionError(startData.message || "Could not start YouTube playlist download.");
     return;
   }
 
@@ -755,6 +800,7 @@ function updateFormatControls() {
   const isSpotify = selectedFormat === "spotify";
   const isBulk = selectedFormat === "bulk";
   const isMyPlaylists = selectedFormat === "my-playlists";
+  const isYtPlaylist = selectedFormat === "yt-playlist";
 
   qualityRow.hidden = !isVideo;
   if (bulkRow) {
@@ -780,10 +826,10 @@ function updateFormatControls() {
   modeEyebrow.textContent = getModeEyebrow();
   modeTitle.textContent = getModeTitle();
   modeCopy.textContent = getModeCopy();
-  urlLabel.textContent = isSpotify ? "Spotify track URL" : "YouTube video URL";
+  urlLabel.textContent = isSpotify ? "Spotify track URL" : (isYtPlaylist ? "YouTube playlist URL" : "YouTube video URL");
   input.placeholder = isSpotify
     ? "https://open.spotify.com/track/... or /playlist/..."
-    : "https://www.youtube.com/watch?v=...";
+    : (isYtPlaylist ? "https://www.youtube.com/playlist?list=..." : "https://www.youtube.com/watch?v=...");
   statusText.textContent = getDefaultStatus();
   playlistProgress.hidden = true;
   if (isBulk) {
@@ -825,6 +871,10 @@ function getDefaultStatus() {
     return "Select a playlist to download it.";
   }
 
+  if (selectedFormat === "yt-playlist") {
+    return "Downloads all videos in the playlist sequentially and packages them in a single ZIP.";
+  }
+
   return "Downloads audio, converts at 320 kbps, then embeds cover art.";
 }
 
@@ -847,6 +897,10 @@ function getLoadingStatus() {
 
   if (selectedFormat === "bulk") {
     return "Creating bulk download queue and preparing MP3 ZIP...";
+  }
+
+  if (selectedFormat === "yt-playlist") {
+    return "Preparing YouTube playlist download...";
   }
 
   return "Downloading audio, converting to MP3, and writing metadata...";
@@ -875,6 +929,10 @@ function getQualityPillText() {
     return "My Playlists";
   }
 
+  if (selectedFormat === "yt-playlist") {
+    return "Playlist ZIP";
+  }
+
   return "320 kbps";
 }
 
@@ -891,6 +949,10 @@ function getSubmitButtonText() {
 
   if (selectedFormat === "spotify") {
     return "Download Spotify MP3";
+  }
+
+  if (selectedFormat === "yt-playlist") {
+    return "Download Full Playlist";
   }
 
   return "Download MP3";
@@ -919,6 +981,10 @@ function getModeEyebrow() {
     return "Spotify library";
   }
 
+  if (selectedFormat === "yt-playlist") {
+    return "YouTube playlist downloader";
+  }
+
   return "YouTube audio converter";
 }
 
@@ -943,6 +1009,10 @@ function getModeTitle() {
 
   if (selectedFormat === "my-playlists") {
     return "Download your personal playlists.";
+  }
+
+  if (selectedFormat === "yt-playlist") {
+    return "Download whole YouTube playlists.";
   }
 
   return "Turn videos into polished MP3s.";
@@ -971,6 +1041,10 @@ function getModeCopy() {
     return "View your Spotify library and download full playlists directly inside TuneLift.";
   }
 
+  if (selectedFormat === "yt-playlist") {
+    return "Paste one YouTube playlist link and download all videos as clean, tagged MP3s sequentially with original thumbnails.";
+  }
+
   return "Paste one YouTube video link and download a 320 kbps MP3 with clean music metadata.";
 }
 
@@ -995,6 +1069,10 @@ function getFeatureText(index) {
 
   if (selectedFormat === "my-playlists") {
     return ["Full library sync", "320 kbps MP3", "ZIP for playlists"][index - 1];
+  }
+
+  if (selectedFormat === "yt-playlist") {
+    return ["Direct YouTube mode", "320 kbps MP3", "ZIP for playlists"][index - 1];
   }
 
   return ["Best available audio", "320 kbps MP3", "Cover and tags"][index - 1];
@@ -1097,6 +1175,22 @@ function isSpotifyPlaylist(url) {
   }
 }
 
+function isYoutubePlaylist(url) {
+  if (getSelectedFormat() !== "yt-playlist") {
+    return false;
+  }
+
+  try {
+    const parsedUrl = new URL(url);
+    if (!parsedUrl.hostname.includes("youtube.com") && !parsedUrl.hostname.includes("youtu.be")) {
+      return false;
+    }
+    return parsedUrl.searchParams.has("list") || parsedUrl.pathname.includes("/playlist");
+  } catch (error) {
+    return false;
+  }
+}
+
 function setPreviewError(message) {
   clearConfirmedMatch();
   previewArt.classList.remove("is-loading", "has-image");
@@ -1161,6 +1255,70 @@ async function loadPlaylistDetails(url) {
     setPreviewData({
       title: playlist.name || "Spotify Playlist",
       artist: `${playlist.total || 0} songs`,
+      thumbnail: playlist.thumbnail || "",
+      kind: "playlist",
+      total: playlist.total || 0,
+    });
+    renderPlaylistTracks(playlist.tracks || [], null);
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      playlistSubtitle.textContent = "Could not load playlist details.";
+    }
+  }
+}
+
+async function loadYoutubePlaylistDetails(url) {
+  if (!playlistPanel || !playlistTracks) {
+    return;
+  }
+
+  if (url === lastPlaylistDetailsUrl && playlistTracks.children.length) {
+    playlistPanel.hidden = false;
+    return;
+  }
+
+  if (playlistDetailsController) {
+    playlistDetailsController.abort();
+  }
+
+  playlistDetailsController = new AbortController();
+  lastPlaylistDetailsUrl = url;
+
+  try {
+    playlistPanel.hidden = false;
+    if (playlistDone) {
+      playlistDone.hidden = true;
+    }
+    playlistProgressRow.hidden = true;
+    playlistProgressText.hidden = true;
+    playlistTracks.innerHTML = "";
+    playlistSubtitle.textContent = "Loading YouTube playlist...";
+
+    const formData = new FormData();
+    formData.set("url", url);
+
+    const response = await fetch("/api/youtube-playlist/prepare", {
+      method: "POST",
+      body: formData,
+      signal: playlistDetailsController.signal,
+    });
+    const data = await safeReadJson(response);
+
+    if (!response.ok || !data.ok) {
+      playlistSubtitle.textContent = data.message || "Could not load playlist details.";
+      return;
+    }
+
+    preparedPlaylistJobId = data.job_id || "";
+    const playlist = data.playlist || {};
+    setPlaylistHeader({
+      name: playlist.name || "YouTube Playlist",
+      thumbnail: playlist.thumbnail || "",
+      total: playlist.total || 0,
+    });
+    setPreviewData({
+      title: playlist.name || "YouTube Playlist",
+      artist: `${playlist.total || 0} videos`,
       thumbnail: playlist.thumbnail || "",
       kind: "playlist",
       total: playlist.total || 0,
@@ -1491,3 +1649,634 @@ function setSubmitButtonsDisabled(disabled) {
     submitButton.disabled = disabled;
   });
 }
+
+
+// ==========================================================================
+// QUEUE & HISTORY HANDLERS
+// ==========================================================================
+
+let activeSingleJobId = null;
+
+// Initialize elements
+const queueTabBtn = document.querySelector('[data-qh-tab="queue"]');
+const historyTabBtn = document.querySelector('[data-qh-tab="history"]');
+const queueContent = document.querySelector('[data-qh-content="queue"]');
+const historyContent = document.querySelector('[data-qh-content="history"]');
+
+const queueCount = document.querySelector('[data-queue-count]');
+const historyCount = document.querySelector('[data-history-count]');
+
+const queueList = document.querySelector('[data-queue-list]');
+const historyList = document.querySelector('[data-history-list]');
+
+const queueEmpty = document.querySelector('[data-queue-empty]');
+const historyEmpty = document.querySelector('[data-history-empty]');
+const historySearch = document.querySelector('[data-history-search]');
+const pauseQueueButton = document.querySelector('[data-pause-queue]');
+const resumeQueueButton = document.querySelector('[data-resume-queue]');
+const clearHistoryButton = document.querySelector('[data-clear-history]');
+let lastCompletedIds = new Set();
+let lastQueuePaused = false;
+let historyFilter = "";
+
+// Handle tab switching
+if (queueTabBtn && historyTabBtn) {
+  queueTabBtn.addEventListener('click', () => {
+    queueTabBtn.classList.add('active');
+    historyTabBtn.classList.remove('active');
+    queueContent.classList.add('active');
+    historyContent.classList.remove('active');
+  });
+
+  historyTabBtn.addEventListener('click', () => {
+    historyTabBtn.classList.add('active');
+    queueTabBtn.classList.remove('active');
+    historyContent.classList.add('active');
+    queueContent.classList.remove('active');
+  });
+}
+
+if (historySearch) {
+  historySearch.addEventListener("input", () => {
+    historyFilter = historySearch.value.trim().toLowerCase();
+    pollQueueStatus();
+  });
+}
+
+if (pauseQueueButton) {
+  pauseQueueButton.addEventListener("click", () => queueCommand("/api/queue/pause", "Queue paused"));
+}
+
+if (resumeQueueButton) {
+  resumeQueueButton.addEventListener("click", () => queueCommand("/api/queue/resume", "Queue resumed"));
+}
+
+if (clearHistoryButton) {
+  clearHistoryButton.addEventListener("click", async () => {
+    await queueCommand("/api/history/clear", "History cleared");
+    pollQueueStatus();
+  });
+}
+
+// Start polling loop
+function startQueuePolling() {
+  pollQueueStatus();
+  setInterval(pollQueueStatus, 1200);
+}
+
+async function pollQueueStatus() {
+  try {
+    const response = await fetch('/api/queue/poll');
+    const data = await safeReadJson(response);
+
+    if (response.ok && data.ok) {
+      updateQueueUi(data.active, data.history, data.current_job_id, data.queue_paused);
+    }
+  } catch (error) {
+    console.error("Queue poll failed:", error);
+  }
+}
+
+function updateQueueUi(activeList, historyListItems, currentJobId, queuePaused = false) {
+  const completedIds = new Set(historyListItems.filter(item => item.status === "Completed").map(item => item.id || item.job_id || item.download_id));
+  completedIds.forEach((id) => {
+    if (!lastCompletedIds.has(id)) {
+      const item = historyListItems.find(entry => (entry.id || entry.job_id || entry.download_id) === id);
+      notifyUser("Download completed", item ? item.title : "Your download is ready");
+    }
+  });
+  if (queuePaused !== lastQueuePaused) {
+    notifyUser(queuePaused ? "Queue paused" : "Queue resumed", "TuneLift queue status changed");
+  }
+  lastCompletedIds = completedIds;
+  lastQueuePaused = queuePaused;
+
+  const filteredHistory = historyFilter
+    ? historyListItems.filter(item => `${item.title || ""} ${item.type || ""} ${item.playlist_name || ""}`.toLowerCase().includes(historyFilter))
+    : historyListItems;
+
+  // Update counts
+  if (queueCount) queueCount.textContent = activeList.length;
+  if (historyCount) historyCount.textContent = filteredHistory.length;
+
+  // Render active queue list
+  if (queueList) {
+    if (activeList.length === 0) {
+      queueEmpty.style.display = 'block';
+      queueList.innerHTML = '';
+    } else {
+      queueEmpty.style.display = 'none';
+      queueList.innerHTML = activeList.map(item => buildQueueItemMarkup(item)).join('');
+    }
+  }
+
+  // Render history list
+  if (historyList) {
+    if (filteredHistory.length === 0) {
+      historyEmpty.style.display = 'block';
+      historyList.innerHTML = '';
+    } else {
+      historyEmpty.style.display = 'none';
+      historyList.innerHTML = filteredHistory.map(item => buildHistoryItemMarkup(item)).join('');
+    }
+  }
+
+  // Check active single job progress
+  if (activeSingleJobId) {
+    // Check in active queue first
+    const activeJob = activeList.find(item => item.id === activeSingleJobId);
+    if (activeJob) {
+      if (activeJob.status === 'Downloading') {
+        const speed = activeJob.speed ? ` @ ${activeJob.speed}` : '';
+        const eta = activeJob.eta ? ` · ETA: ${activeJob.eta}` : '';
+        statusText.textContent = `Downloading (${activeJob.percent}%)${speed}${eta}`;
+      } else if (activeJob.status === 'Pending') {
+        statusText.textContent = 'Pending in queue...';
+      }
+    } else {
+      // Check in history (meaning it finished, failed, or was stopped)
+      const finishedJob = historyListItems.find(item => item.id === activeSingleJobId);
+      if (finishedJob) {
+        if (finishedJob.status === 'Completed') {
+          // Trigger browser download
+          window.location.href = `/api/queue/download/${activeSingleJobId}`;
+          // Reset form state
+          form.classList.remove("is-loading");
+          setSubmitButtonsDisabled(false);
+          input.readOnly = false;
+          statusText.textContent = "Download complete.";
+        } else if (finishedJob.status === 'Failed') {
+          showConversionError(finishedJob.error || "Download failed.");
+        } else if (finishedJob.status === 'Stopped') {
+          showConversionError("Download stopped manually.");
+        } else if (finishedJob.status === 'Not Found') {
+          showConversionError("Track not found.");
+        }
+        activeSingleJobId = null;
+      }
+    }
+  }
+}
+
+function buildQueueItemMarkup(item) {
+  const isDownloading = item.status === 'Downloading';
+  const isPending = item.status === 'Pending';
+  const isPaused = item.status === 'Paused';
+  const progressPercent = item.percent || 0;
+  const itemId = item.id || item.job_id || item.download_id;
+  
+  const showCover = item.thumbnail ? `<img src="${item.thumbnail}" class="qh-item-cover" alt="cover">` : `<div class="qh-item-cover" style="display:flex;align-items:center;justify-content:center;font-size:1.5rem;">🎵</div>`;
+
+  return `
+    <div class="qh-item" id="qh-item-${itemId}">
+      ${showCover}
+      <div class="qh-item-info">
+        <p class="qh-item-title">${escapeHtml(item.title)}</p>
+        <div class="qh-item-meta">
+          <span class="qh-item-type-badge">${escapeHtml(item.type)}</span>
+          <div class="qh-item-status-container">
+            <span class="qh-item-status-dot status-dot-${item.status.toLowerCase().replace(' ', '')}"></span>
+            <span>${escapeHtml(item.status)}</span>
+            ${item.retry_status ? `<span>${escapeHtml(item.retry_status)}</span>` : ''}
+          </div>
+        </div>
+        ${isDownloading ? `
+          <div class="qh-item-progress-container">
+            <div class="qh-item-progress-bar">
+              <div class="qh-item-progress-fill" style="width: ${progressPercent}%"></div>
+            </div>
+            <div class="qh-item-progress-text">
+              <span>${progressPercent}% · ${escapeHtml(item.speed || 'Calculating...')}</span>
+              <span>ETA: ${escapeHtml(item.eta || 'Calculating...')}</span>
+            </div>
+          </div>
+        ` : ''}
+      </div>
+      <div class="qh-item-actions">
+        ${(isDownloading || isPending) && itemId ? `
+          <button type="button" class="qh-btn qh-btn-pause" onclick="pauseQueueJob('${itemId}')">Pause</button>
+        ` : ''}
+        ${isPaused && itemId ? `
+          <button type="button" class="qh-btn qh-btn-download" onclick="resumeQueueJob('${itemId}')">Resume</button>
+        ` : ''}
+        ${itemId ? `
+          <button type="button" class="qh-btn qh-btn-stop" onclick="cancelQueueJob('${itemId}')">Cancel</button>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
+function buildHistoryItemMarkup(item) {
+  const showCover = item.thumbnail ? `<img src="${item.thumbnail}" class="qh-item-cover" alt="cover">` : `<div class="qh-item-cover" style="display:flex;align-items:center;justify-content:center;font-size:1.5rem;">🎵</div>`;
+  const isCompleted = item.status === 'Completed';
+  const isFailed = item.status === 'Failed' || item.status === 'Stopped';
+  const itemId = item.id || item.job_id || item.download_id;
+
+  // Format date/time
+  let dateStr = "";
+  if (item.date_time) {
+    try {
+      const d = new Date(item.date_time);
+      dateStr = d.toLocaleDateString() + ' ' + d.toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+    } catch(e) {}
+  }
+
+  // Size
+  const sizeText = item.file_size ? ` · ${item.file_size}` : '';
+
+  return `
+    <div class="qh-item" id="qh-item-${itemId}">
+      ${showCover}
+      <div class="qh-item-info">
+        <p class="qh-item-title">${escapeHtml(item.title)}</p>
+        <div class="qh-item-meta">
+          <span class="qh-item-type-badge">${escapeHtml(item.type)}</span>
+          <div class="qh-item-status-container">
+            <span class="qh-item-status-dot status-dot-${item.status.toLowerCase().replace(' ', '')}"></span>
+            <span>${escapeHtml(item.status)}</span>
+          </div>
+          <span>${dateStr}${sizeText}</span>
+        </div>
+      </div>
+      <div class="qh-item-actions">
+        ${isCompleted ? (
+          itemId ? `
+            <a class="qh-btn qh-btn-download" href="/api/queue/download/${itemId}">Download</a>
+            ${item.saved_location && item.saved_location.toLowerCase().endsWith(".mp3") ? `<button type="button" class="qh-btn qh-btn-download" onclick="playHistoryItem('${itemId}')">Play</button>` : ''}
+          ` : `
+            <button type="button" class="qh-btn qh-btn-download" disabled style="opacity: 0.5; cursor: not-allowed;" title="Download ID is missing.">Download Unavailable</button>
+          `
+        ) : ''}
+        ${isFailed && itemId ? `
+          <button type="button" class="qh-btn qh-btn-retry" onclick="retryQueueJob('${itemId}')">Retry</button>
+        ` : ''}
+        ${itemId ? `<button type="button" class="qh-btn qh-btn-stop" onclick="deleteHistoryItem('${itemId}')">Delete</button>` : ''}
+      </div>
+    </div>
+  `;
+}
+
+async function stopQueueJob(jobId) {
+  return cancelQueueJob(jobId);
+}
+
+async function queueCommand(url, successMessage) {
+  try {
+    const res = await fetch(url, { method: 'POST', headers: { "Content-Type": "application/json" } });
+    const data = await safeReadJson(res);
+    if (!res.ok || !data.ok) {
+      showToast(data.message || "Request failed");
+      return false;
+    }
+    if (successMessage) showToast(successMessage);
+    return true;
+  } catch (err) {
+    console.error("Queue command failed:", err);
+    showToast("Could not reach TuneLift backend");
+    return false;
+  }
+}
+
+async function pauseQueueJob(jobId) {
+  await queueCommand(`/api/queue/pause/${jobId}`, "Download paused");
+}
+
+async function resumeQueueJob(jobId) {
+  await queueCommand(`/api/queue/resume/${jobId}`, "Download resumed");
+  if (queueTabBtn) queueTabBtn.click();
+}
+
+async function cancelQueueJob(jobId) {
+  try {
+    const res = await fetch(`/api/queue/cancel/${jobId}`, { method: 'POST' });
+    const data = await safeReadJson(res);
+    if (!res.ok || !data.ok) {
+      showToast(data.message || "Failed to cancel download.");
+    }
+  } catch (err) {
+    console.error("Cancel job failed:", err);
+  }
+}
+
+async function deleteHistoryItem(jobId) {
+  await queueCommand(`/api/history/delete/${jobId}`, "History item deleted");
+  pollQueueStatus();
+}
+
+async function retryQueueJob(jobId) {
+  try {
+    const res = await fetch(`/api/queue/retry/${jobId}`, { method: 'POST' });
+    const data = await safeReadJson(res);
+    if (res.ok && data.ok) {
+      // Switch back to Active Queue tab to show progress
+      if (queueTabBtn) queueTabBtn.click();
+    } else {
+      showToast(data.message || "Failed to retry download.");
+    }
+  } catch (err) {
+    console.error("Retry job failed:", err);
+  }
+}
+
+// Make globally accessible for inline onclick handlers
+window.stopQueueJob = stopQueueJob;
+window.pauseQueueJob = pauseQueueJob;
+window.resumeQueueJob = resumeQueueJob;
+window.cancelQueueJob = cancelQueueJob;
+window.retryQueueJob = retryQueueJob;
+window.deleteHistoryItem = deleteHistoryItem;
+
+// Initialize polling
+startQueuePolling();
+
+// ==========================================================================
+// PLAYER, PLAYLISTS, SETTINGS, STORAGE, ANALYTICS, NOTIFICATIONS
+// ==========================================================================
+
+const toastStack = document.querySelector("[data-toast-stack]");
+const playerDrawer = document.querySelector("[data-player-drawer]");
+const openPlayerButtons = document.querySelectorAll("[data-open-player], [data-mini-open], [data-mobile-player-link]");
+const closePlayerButton = document.querySelector("[data-close-player]");
+const playerLibrary = document.querySelector("[data-player-library]");
+const playerTitle = document.querySelector("[data-player-title]");
+const playerSeek = document.querySelector("[data-player-seek]");
+const playerToggle = document.querySelector("[data-player-toggle]");
+const playerPrev = document.querySelector("[data-player-prev]");
+const playerNext = document.querySelector("[data-player-next]");
+const playerShuffle = document.querySelector("[data-player-shuffle]");
+const playerRepeat = document.querySelector("[data-player-repeat]");
+const miniPlayer = document.querySelector("[data-bottom-player]");
+const miniToggle = document.querySelector("[data-mini-toggle]");
+const miniTitle = document.querySelector("[data-mini-title]");
+const analyticsCards = document.querySelector("[data-analytics-cards]");
+const storagePanel = document.querySelector("[data-storage-panel]");
+const refreshAnalyticsButton = document.querySelector("[data-refresh-analytics]");
+const cleanStorageButton = document.querySelector("[data-clean-storage]");
+const localPlaylistName = document.querySelector("[data-local-playlist-name]");
+const localSongPicker = document.querySelector("[data-local-song-picker]");
+const localPlaylistsContainer = document.querySelector("[data-local-playlists]");
+const createLocalPlaylistButton = document.querySelector("[data-create-local-playlist]");
+const saveSettingsButton = document.querySelector("[data-save-settings]");
+const audioElement = new Audio();
+audioElement.preload = "metadata";
+let playerSongs = [];
+let playerIndex = -1;
+let shuffleEnabled = false;
+let repeatEnabled = false;
+let localPlaylists = [];
+
+function showToast(message) {
+  if (!toastStack) return;
+  const toast = document.createElement("div");
+  toast.className = "toast";
+  toast.textContent = message;
+  toastStack.appendChild(toast);
+  window.setTimeout(() => toast.remove(), 3600);
+}
+
+function notifyUser(title, body) {
+  showToast(`${title}: ${body}`);
+  if (!("Notification" in window)) return;
+  if (Notification.permission === "granted") {
+    new Notification(title, { body });
+  } else if (Notification.permission !== "denied") {
+    Notification.requestPermission().then((permission) => {
+      if (permission === "granted") new Notification(title, { body });
+    });
+  }
+}
+
+openPlayerButtons.forEach(button => button.addEventListener("click", () => {
+  if (playerDrawer) playerDrawer.hidden = false;
+  loadPlayerLibrary();
+}));
+if (closePlayerButton) closePlayerButton.addEventListener("click", () => playerDrawer.hidden = true);
+if (playerToggle) playerToggle.addEventListener("click", togglePlayback);
+if (miniToggle) miniToggle.addEventListener("click", togglePlayback);
+if (playerPrev) playerPrev.addEventListener("click", playPrevious);
+if (playerNext) playerNext.addEventListener("click", playNext);
+if (playerShuffle) playerShuffle.addEventListener("click", () => {
+  shuffleEnabled = !shuffleEnabled;
+  playerShuffle.classList.toggle("active", shuffleEnabled);
+});
+if (playerRepeat) playerRepeat.addEventListener("click", () => {
+  repeatEnabled = !repeatEnabled;
+  playerRepeat.classList.toggle("active", repeatEnabled);
+});
+
+audioElement.addEventListener("timeupdate", () => {
+  if (playerSeek && audioElement.duration) {
+    playerSeek.value = String((audioElement.currentTime / audioElement.duration) * 100);
+  }
+});
+audioElement.addEventListener("ended", () => repeatEnabled ? playSong(playerIndex) : playNext());
+if (playerSeek) {
+  playerSeek.addEventListener("input", () => {
+    if (audioElement.duration) audioElement.currentTime = (Number(playerSeek.value) / 100) * audioElement.duration;
+  });
+}
+
+async function loadPlayerLibrary() {
+  const response = await fetch("/api/player/library");
+  const data = await safeReadJson(response);
+  if (!response.ok || !data.ok) return;
+  playerSongs = data.songs || [];
+  if (localSongPicker) {
+    localSongPicker.innerHTML = playerSongs.map((song, index) => `<option value="${index}">${escapeHtml(song.title)}</option>`).join("");
+  }
+  renderPlayerLibrary();
+}
+
+function renderPlayerLibrary() {
+  if (!playerLibrary) return;
+  playerLibrary.innerHTML = playerSongs.map((song, index) => `
+    <li>
+      <button type="button" onclick="playSong(${index})">${escapeHtml(song.title)}</button>
+    </li>
+  `).join("") || '<li class="playlist-panel__empty">Downloaded MP3s will appear here.</li>';
+}
+
+function playSong(index) {
+  if (!playerSongs[index]) return;
+  playerIndex = index;
+  audioElement.src = playerSongs[index].url;
+  audioElement.play().catch(() => showToast("Playback could not start"));
+  updatePlayerLabels(playerSongs[index].title, true);
+}
+
+function playHistoryItem(jobId) {
+  audioElement.src = `/api/queue/download/${jobId}`;
+  audioElement.play().catch(() => showToast("Playback could not start"));
+  updatePlayerLabels("History item", true);
+}
+
+function togglePlayback() {
+  if (!audioElement.src && playerSongs.length) playSong(0);
+  else if (audioElement.paused) audioElement.play();
+  else audioElement.pause();
+  updatePlayerLabels(playerSongs[playerIndex] ? playerSongs[playerIndex].title : "Playing", audioElement.paused === false);
+}
+
+function playNext() {
+  if (!playerSongs.length) return;
+  const nextIndex = shuffleEnabled ? Math.floor(Math.random() * playerSongs.length) : (playerIndex + 1) % playerSongs.length;
+  playSong(nextIndex);
+}
+
+function playPrevious() {
+  if (!playerSongs.length) return;
+  playSong((playerIndex - 1 + playerSongs.length) % playerSongs.length);
+}
+
+function updatePlayerLabels(title, playing) {
+  if (playerTitle) playerTitle.textContent = title;
+  if (miniTitle) miniTitle.textContent = title;
+  if (playerToggle) playerToggle.textContent = playing ? "Pause" : "Play";
+  if (miniToggle) miniToggle.textContent = playing ? "Pause" : "Play";
+  if (miniPlayer) miniPlayer.hidden = false;
+}
+
+window.playSong = playSong;
+window.playHistoryItem = playHistoryItem;
+
+async function loadLocalPlaylists() {
+  const response = await fetch("/api/local-playlists");
+  const data = await safeReadJson(response);
+  localPlaylists = data.playlists || [];
+  renderLocalPlaylists();
+}
+
+async function saveLocalPlaylists() {
+  await fetch("/api/local-playlists", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ playlists: localPlaylists }),
+  });
+}
+
+function renderLocalPlaylists() {
+  if (!localPlaylistsContainer) return;
+  localPlaylistsContainer.innerHTML = localPlaylists.map((playlist, pIndex) => `
+    <div class="local-playlist-card">
+      <input value="${escapeHtml(playlist.name)}" onchange="renameLocalPlaylist(${pIndex}, this.value)">
+      <button type="button" onclick="addSongToLocalPlaylist(${pIndex})">Add Song</button>
+      <button type="button" onclick="deleteLocalPlaylist(${pIndex})">Delete</button>
+      <ol>
+        ${(playlist.songs || []).map((song, sIndex) => `
+          <li draggable="true" ondragstart="dragLocalSong(${pIndex}, ${sIndex})" ondrop="dropLocalSong(${pIndex}, ${sIndex})" ondragover="event.preventDefault()">
+            <span>${escapeHtml(song.title)}</span>
+            <button type="button" onclick="removeLocalSong(${pIndex}, ${sIndex})">Remove</button>
+          </li>
+        `).join("")}
+      </ol>
+    </div>
+  `).join("") || '<p class="playlist-panel__empty">Create a playlist from downloaded MP3s.</p>';
+}
+
+if (createLocalPlaylistButton) {
+  createLocalPlaylistButton.addEventListener("click", async () => {
+    const name = (localPlaylistName && localPlaylistName.value.trim()) || "New Playlist";
+    localPlaylists.push({ id: Date.now().toString(), name, songs: [] });
+    if (localPlaylistName) localPlaylistName.value = "";
+    await saveLocalPlaylists();
+    renderLocalPlaylists();
+  });
+}
+
+let draggedLocalSong = null;
+function renameLocalPlaylist(index, name) { localPlaylists[index].name = name || "Untitled"; saveLocalPlaylists(); }
+function deleteLocalPlaylist(index) { localPlaylists.splice(index, 1); saveLocalPlaylists().then(renderLocalPlaylists); }
+function addSongToLocalPlaylist(index) {
+  const song = playerSongs[Number(localSongPicker.value)];
+  if (!song) return;
+  localPlaylists[index].songs.push(song);
+  saveLocalPlaylists().then(renderLocalPlaylists);
+}
+function removeLocalSong(pIndex, sIndex) { localPlaylists[pIndex].songs.splice(sIndex, 1); saveLocalPlaylists().then(renderLocalPlaylists); }
+function dragLocalSong(pIndex, sIndex) { draggedLocalSong = { pIndex, sIndex }; }
+function dropLocalSong(pIndex, sIndex) {
+  if (!draggedLocalSong || draggedLocalSong.pIndex !== pIndex) return;
+  const songs = localPlaylists[pIndex].songs;
+  const [song] = songs.splice(draggedLocalSong.sIndex, 1);
+  songs.splice(sIndex, 0, song);
+  draggedLocalSong = null;
+  saveLocalPlaylists().then(renderLocalPlaylists);
+}
+Object.assign(window, { renameLocalPlaylist, deleteLocalPlaylist, addSongToLocalPlaylist, removeLocalSong, dragLocalSong, dropLocalSong });
+
+async function loadSettings() {
+  const response = await fetch("/api/settings");
+  const data = await safeReadJson(response);
+  if (!response.ok || !data.ok) return;
+  document.querySelectorAll("[data-setting]").forEach((field) => {
+    const key = field.dataset.setting;
+    if (field.type === "checkbox") field.checked = Boolean(data.settings[key]);
+    else field.value = data.settings[key] ?? "";
+  });
+}
+
+if (saveSettingsButton) {
+  saveSettingsButton.addEventListener("click", async () => {
+    const payload = {};
+    document.querySelectorAll("[data-setting]").forEach((field) => {
+      payload[field.dataset.setting] = field.type === "checkbox" ? field.checked : field.value;
+    });
+    await fetch("/api/settings", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+    showToast("Settings saved");
+  });
+}
+
+function formatBytesLocal(bytes) {
+  let value = Number(bytes || 0);
+  for (const unit of ["B", "KB", "MB", "GB"]) {
+    if (value < 1024 || unit === "GB") return `${value.toFixed(unit === "B" ? 0 : 1)} ${unit}`;
+    value /= 1024;
+  }
+  return `${value.toFixed(1)} GB`;
+}
+
+async function loadStorage() {
+  const response = await fetch("/api/storage");
+  const data = await safeReadJson(response);
+  if (!storagePanel || !data.ok) return;
+  storagePanel.innerHTML = `
+    <p>Downloads folder: <strong>${formatBytesLocal(data.downloads_size)}</strong></p>
+    <p>MP3 files: <strong>${data.song_count}</strong></p>
+    <p>Duplicates: <strong>${(data.duplicates || []).length}</strong></p>
+    <p>Temporary files: <strong>${(data.temp_files || []).length}</strong></p>
+    <p>Broken ZIP files: <strong>${(data.broken_zips || []).length}</strong></p>
+  `;
+}
+
+if (cleanStorageButton) {
+  cleanStorageButton.addEventListener("click", async () => {
+    const response = await fetch("/api/storage/cleanup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ remove_duplicates: true }) });
+    const data = await safeReadJson(response);
+    showToast(`Cleaned ${data.removed ? data.removed.length : 0} files`);
+    loadStorage();
+  });
+}
+
+async function loadAnalytics() {
+  const response = await fetch("/api/analytics");
+  const data = await safeReadJson(response);
+  if (!analyticsCards || !data.ok) return;
+  const stats = data.queue_statistics || {};
+  analyticsCards.innerHTML = [
+    ["Songs", data.total_songs],
+    ["Playlists", data.total_playlists],
+    ["Storage", formatBytesLocal(data.storage_used)],
+    ["Top type", data.most_downloaded_type],
+    ["Average speed", data.average_speed],
+    ["Queue", `${stats.active || 0} active / ${stats.completed || 0} done`],
+  ].map(([label, value]) => `<div class="metric-card"><span>${label}</span><strong>${value}</strong></div>`).join("");
+}
+
+if (refreshAnalyticsButton) refreshAnalyticsButton.addEventListener("click", loadAnalytics);
+
+loadPlayerLibrary();
+loadLocalPlaylists();
+loadSettings();
+loadStorage();
+loadAnalytics();

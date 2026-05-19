@@ -104,24 +104,60 @@ class DownloadFailed(Exception):
     """Raised when yt-dlp cannot download the requested video."""
 
 
-def download_audio_and_thumbnail(url, output_folder):
-    """Download the best audio stream and thumbnail for one YouTube video."""
+class DownloadStoppedException(Exception):
+    """Raised to instantly halt an active download."""
+    pass
+
+
+def download_audio_and_thumbnail(url, output_folder, progress_callback=None):
+    """Download the best audio stream and thumbnail for a direct YouTube URL.
+
+    This is the FAST DIRECT MODE path used exclusively by convert_youtube_to_mp3().
+    NO Spotify lookup, NO search, NO metadata enrichment — only the exact video
+    at ``url`` is fetched.  The YouTube thumbnail is embedded as cover art.
+    """
     output_folder = Path(output_folder)
     output_template = str(output_folder / "source.%(ext)s")
 
+    logger.info("[DirectMP3] Direct MP3 mode enabled — url=%r", url)
+    logger.info("[DirectMP3] Spotify skipped")
+    logger.info("[DirectMP3] Using YouTube thumbnail as cover art")
+    logger.info("[DirectMP3] Fast conversion mode enabled")
+
+    def download_hook(data):
+        if progress_callback:
+            progress_callback(format_download_progress(data))
+
     options = {
-        "format": "bestaudio",
+        # Prefer m4a/aac — faster FFmpeg conversion than opus/webm, and
+        # native AAC decoding avoids an extra transcode step.
+        "format": "bestaudio[ext=m4a]/bestaudio[acodec=aac]/bestaudio",
         "outtmpl": output_template,
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        # Download the thumbnail so we can embed it as cover art without
+        # any Spotify / iTunes network call.
         "writethumbnail": True,
+        # Speed optimisations: more fragment connections, larger chunk size,
+        # automatic retries so transient errors don't abort the download.
+        "concurrent_fragment_downloads": 4,
+        "http_chunk_size": 10 * 1024 * 1024,
+        "retries": 5,
+        "fragment_retries": 5,
+        "socket_timeout": 30,
+        "progress_hooks": [download_hook],
     }
     apply_ffmpeg_location(options)
 
     try:
         with YoutubeDL(options) as ydl:
-            return ydl.extract_info(url, download=True)
+            info = ydl.extract_info(url, download=True)
+            logger.info(
+                "[DirectMP3] Download complete — title=%r channel=%r",
+                info.get("title"), info.get("channel") or info.get("uploader"),
+            )
+            return info
     except DownloadError as exc:
         raise DownloadFailed(get_download_error_message(exc)) from exc
     except ExtractorError as exc:
@@ -497,10 +533,14 @@ def score_youtube_result(entry, track_info):
     return score, ", ".join(reasons)
 
 
-def download_audio_from_search(search_query, output_folder, track_info=None):
+def download_audio_from_search(search_query, output_folder, track_info=None, progress_callback=None):
     """Search YouTube and download the best matching original audio result."""
     output_folder = Path(output_folder)
     output_template = str(output_folder / "source.%(ext)s")
+
+    def download_hook(data):
+        if progress_callback:
+            progress_callback(format_download_progress(data))
 
     options = {
         "format": "bestaudio",
@@ -509,6 +549,7 @@ def download_audio_from_search(search_query, output_folder, track_info=None):
         "quiet": True,
         "no_warnings": True,
         "writethumbnail": True,
+        "progress_hooks": [download_hook],
     }
     apply_ffmpeg_location(options)
 

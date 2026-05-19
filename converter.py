@@ -2,6 +2,7 @@ import re
 import shutil
 import uuid
 import zipfile
+import yt_dlp
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -91,42 +92,74 @@ def safe_filename(name):
     return cleaned[:120] or "youtube-audio"
 
 
-def convert_youtube_to_mp3(url, download_root):
+def convert_youtube_to_mp3(url, download_root, progress_callback=None):
     """Download a YouTube video by direct URL and convert it to a tagged MP3.
 
-    HARD RULE: This function downloads ONLY the exact video at ``url``.
-    No search, no Spotify lookup, no iTunes lookup, no metadata replacement.
+    ╔═══════════════════════════════════════════════════════════════════╗
+    ║  DIRECT MP3 MODE — FAST PATH                                      ║
+    ║  • NO Spotify lookup          • NO search                         ║
+    ║  • NO iTunes enrichment       • NO metadata replacement           ║
+    ║  • Cover art = YouTube thumbnail (same image shown in preview)    ║
+    ║  • Title = YouTube video title only                               ║
+    ╚═══════════════════════════════════════════════════════════════════╝
+
     Every piece of metadata (title, artist, album, cover) comes exclusively
-    from the YouTube video itself.
+    from the YouTube video itself.  The YouTube thumbnail downloaded by
+    yt-dlp is embedded as-is so the cover art always matches the preview.
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
-    _log.info("Direct URL mode — downloading exact URL: %s", url)
-    _log.info("Direct URL mode — Skipping Spotify/iTunes enrichment completely")
+
+    _log.info("[DirectMP3] ══════════════════════════════════")
+    _log.info("[DirectMP3] Direct MP3 mode enabled")
+    _log.info("[DirectMP3] Spotify skipped")
+    _log.info("[DirectMP3] Using YouTube thumbnail as cover art")
+    _log.info("[DirectMP3] Fast conversion mode enabled")
+    _log.info("[DirectMP3] URL: %s", url)
+    _log.info("[DirectMP3] ══════════════════════════════════")
 
     work_dir = Path(download_root) / uuid.uuid4().hex
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        info = download_audio_and_thumbnail(url, work_dir)
+        # download_audio_and_thumbnail() calls yt-dlp directly on the URL.
+        # It does NOT do any search, does NOT call Spotify/iTunes.
+        info = download_audio_and_thumbnail(url, work_dir, progress_callback=progress_callback)
+
         source_audio = find_downloaded_audio(work_dir)
         if source_audio is None:
             raise ConversionError("The audio was downloaded, but the source file could not be found.")
 
-        # All metadata comes from the YouTube video. No external lookups.
+        # All metadata comes from the YouTube video info dict only.
+        # Spotify / iTunes are never consulted.
         title, artist = get_youtube_track_metadata(info, source_audio.stem)
-        _log.info("Direct URL mode — title=%r artist=%r (from YouTube only)", title, artist)
+        _log.info("[DirectMP3] Metadata from YouTube only — title=%r artist=%r", title, artist)
 
-        # Use the thumbnail that yt-dlp downloaded alongside the video.
-        # No Spotify/iTunes cover art is fetched — it would be from an
-        # unrelated track and would corrupt the metadata.
+        # Thumbnail: use whatever yt-dlp wrote alongside the audio file.
+        # This is the same image shown in the preview panel.
+        # No Spotify/iTunes cover art is ever fetched here.
         cover_path = find_thumbnail(work_dir)
+        if cover_path:
+            _log.info("[DirectMP3] Thumbnail found — embedding: %s", cover_path.name)
+        else:
+            # Fallback: look for any image file yt-dlp may have written under
+            # a different name (edge case with some yt-dlp versions).
+            image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+            candidates = [
+                p for p in work_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in image_exts
+            ]
+            cover_path = candidates[0] if candidates else None
+            if cover_path:
+                _log.info("[DirectMP3] Thumbnail (fallback) — embedding: %s", cover_path.name)
+            else:
+                _log.warning("[DirectMP3] No thumbnail found — MP3 will have no cover art")
 
         mp3_path = work_dir / f"{safe_filename(f'{artist} - {title}')}.mp3"
         convert_audio_to_mp3(source_audio, mp3_path, bitrate="320k")
         add_mp3_metadata(mp3_path, title=title, artist=artist, cover_path=cover_path, album="YouTube")
 
-        _log.info("Direct URL mode — complete: %s", mp3_path.name)
+        _log.info("[DirectMP3] Complete — %s", mp3_path.name)
         return ConversionResult(
             file_path=mp3_path,
             download_name=f"{safe_filename(f'{artist} - {title}')}.mp3",
@@ -142,55 +175,71 @@ def convert_youtube_to_mp3(url, download_root):
 
 
 
-def convert_search_to_mp3(query, download_root):
+def convert_search_to_mp3(query, download_root, progress_callback=None):
     """Search YouTube by song name and download the best match as a tagged MP3.
 
-    Unlike convert_youtube_to_mp3() (direct URL, no Spotify), this function
-    uses Spotify/iTunes to get structured track info before searching YouTube,
-    which produces much better search queries and cleaner metadata tags.
+    ╔═══════════════════════════════════════════════════════════════════╗
+    ║  MP3 SEARCH MODE — NO SPOTIFY                                     ║
+    ║  • Plain YouTube search only    • NO Spotify lookup                ║
+    ║  • NO iTunes enrichment         • NO metadata replacement          ║
+    ║  • Title/artist from YouTube    • Thumbnail from YouTube           ║
+    ╚═══════════════════════════════════════════════════════════════════╝
+
+    This function is used when the MP3 Downloader tab receives a song name
+    (not a URL).  Spotify is NOT used here — the search goes straight to
+    YouTube, and all metadata comes from the YouTube result.
+
+    Spotify enrichment only exists in convert_bulk_song() and the Spotify
+    tab routes.
     """
     import logging as _logging
     _log = _logging.getLogger(__name__)
-    _log.info("MP3 search mode — query=%r", query)
+
+    _log.info("[MP3Search] ══════════════════════════════════")
+    _log.info("[MP3Search] MP3 search mode enabled")
+    _log.info("[MP3Search] SPOTIFY FULLY SKIPPED")
+    _log.info("[MP3Search] USING YOUTUBE TITLE ONLY")
+    _log.info("[MP3Search] USING YOUTUBE THUMBNAIL ONLY")
+    _log.info("[MP3Search] NO METADATA REPLACEMENT")
+    _log.info("[MP3Search] Query: %r", query)
+    _log.info("[MP3Search] ══════════════════════════════════")
 
     work_dir = Path(download_root) / uuid.uuid4().hex
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        # Spotify/iTunes lookup improves the YouTube search query and provides
-        # clean title, artist, album, and cover art for the final MP3 tags.
-        music_track = search_spotify_track(query) or search_itunes_track(query)
-
-        if music_track:
-            _log.info(
-                "MP3 search mode — Spotify enrichment enabled: title=%r artist=%r",
-                music_track.get("title"), music_track.get("artist"),
-            )
-            info = download_audio_from_search(music_track["search_query"], work_dir, track_info=music_track)
-        else:
-            _log.info("MP3 search mode — Spotify not found, falling back to plain YouTube search")
-            info = download_audio_from_search(query, work_dir, track_info={"title": query})
+        # Plain YouTube search — NO Spotify, NO iTunes.
+        info = download_audio_from_search(query, work_dir, track_info={"title": query}, progress_callback=progress_callback)
 
         info = get_primary_download_info(info)
         source_audio = find_downloaded_audio(work_dir)
         if source_audio is None:
             raise ConversionError(f'Could not find audio for "{query}".')
 
-        if music_track:
-            title = music_track["title"]
-            artist = music_track["artist"]
-            album_name = music_track["album_name"]
-            cover_path = download_cover_image(music_track["thumbnail"], work_dir)
+        # All metadata comes from the YouTube result.
+        title, artist = get_youtube_track_metadata(info, query)
+        _log.info("[MP3Search] Metadata from YouTube only — title=%r artist=%r", title, artist)
+
+        # Use YouTube thumbnail if available.
+        cover_path = find_thumbnail(work_dir)
+        if not cover_path:
+            image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+            candidates = [
+                p for p in work_dir.iterdir()
+                if p.is_file() and p.suffix.lower() in image_exts
+            ]
+            cover_path = candidates[0] if candidates else None
+
+        if cover_path:
+            _log.info("[MP3Search] Thumbnail found — embedding: %s", cover_path.name)
         else:
-            title, artist = get_youtube_track_metadata(info, query)
-            album_name = "YouTube"
-            cover_path = None
+            _log.warning("[MP3Search] No thumbnail found — MP3 will have no cover art")
 
         mp3_path = work_dir / f"{safe_filename(f'{artist} - {title}')}.mp3"
         convert_audio_to_mp3(source_audio, mp3_path, bitrate="320k")
-        add_mp3_metadata(mp3_path, title=title, artist=artist, cover_path=cover_path, album=album_name)
+        add_mp3_metadata(mp3_path, title=title, artist=artist, cover_path=cover_path, album="YouTube")
 
-        _log.info("MP3 search mode — complete: %s", mp3_path.name)
+        _log.info("[MP3Search] Complete — %s", mp3_path.name)
         return ConversionResult(
             file_path=mp3_path,
             download_name=f"{safe_filename(f'{artist} - {title}')}.mp3",
@@ -266,16 +315,16 @@ def convert_youtube_to_ipod_mp4(url, download_root, progress_callback=None):
         raise ConversionError(f"iPod MP4 conversion failed: {exc}") from exc
 
 
-def convert_spotify_to_mp3(url, download_root, youtube_url=None):
+def convert_spotify_to_mp3(url, download_root, youtube_url=None, progress_callback=None):
     work_dir = Path(download_root) / uuid.uuid4().hex
     work_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         track = get_spotify_track_info(url)
         if youtube_url:
-            download_audio_and_thumbnail(youtube_url, work_dir)
+            download_audio_and_thumbnail(youtube_url, work_dir, progress_callback=progress_callback)
         else:
-            download_audio_from_search(track["search_query"], work_dir, track_info=track)
+            download_audio_from_search(track["search_query"], work_dir, track_info=track, progress_callback=progress_callback)
         source_audio = find_downloaded_audio(work_dir)
         if source_audio is None:
             raise ConversionError("The matching YouTube audio could not be found.")
@@ -474,3 +523,142 @@ def create_zip_file(source_dir, zip_path):
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for file_path in sorted(source_dir.glob("*.mp3")):
             archive.write(file_path, arcname=str(Path(source_dir.name) / file_path.name))
+
+
+def convert_youtube_playlist_to_zip(url, download_root, progress_callback=None):
+    """Download all videos from a YouTube Playlist sequentially as clean MP3 files
+    using only original YouTube titles and thumbnails, with absolutely NO Spotify/enrichment.
+    """
+    import logging as _logging
+    from datetime import datetime
+    _log = _logging.getLogger(__name__)
+
+    _log.info("[YTPlaylist] ══════════════════════════════════")
+    _log.info("[YTPlaylist] PLAYLIST MODE ENABLED")
+    _log.info("[YTPlaylist] SPOTIFY DISABLED")
+    _log.info("[YTPlaylist] FETCHING PLAYLIST INFO")
+    _log.info("[YTPlaylist] URL: %s", url)
+    _log.info("[YTPlaylist] ══════════════════════════════════")
+
+    work_dir = Path(download_root) / uuid.uuid4().hex
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        ydl_opts = {
+            'extract_flat': 'in_playlist',
+            'skip_download': True,
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            playlist_info = ydl.extract_info(url, download=False)
+            
+        playlist_name = safe_filename(playlist_info.get("title") or "YouTube Playlist")
+        playlist_dir = work_dir / playlist_name
+        playlist_dir.mkdir(parents=True, exist_ok=True)
+        
+        entries = [entry for entry in playlist_info.get("entries", []) if entry]
+        total = len(entries)
+        
+        if total > 200:
+            raise ConversionError("Playlist too large. Maximum supported: 200 videos")
+            
+        _log.info("[YTPlaylist] Total items in playlist: %d", total)
+        if progress_callback:
+            progress_callback(playlist_info.get("title") or "YouTube Playlist", total, 0, "Preparing playlist")
+
+        success_count = 0
+        for index, entry in enumerate(entries, start=1):
+            video_url = f"https://www.youtube.com/watch?v={entry.get('id')}" if entry.get('id') else entry.get('url')
+            video_title = entry.get('title') or f"YouTube Video {index}"
+            
+            print(f"[YTPlaylist] DOWNLOADING VIDEO {index}/{total}: {video_title}", flush=True)
+            _log.info("[YTPlaylist] DOWNLOADING VIDEO %d/%d: %r", index, total, video_title)
+            if progress_callback:
+                should_continue = progress_callback(playlist_name, total, index, f"Downloading {index} of {total} songs")
+                if should_continue is False:
+                    # stopped manually
+                    break
+
+            # Handle potentially deleted/unavailable entry indicators from flat extract
+            if not video_url or entry.get('title') == '[Deleted video]' or entry.get('title') == '[Private video]':
+                _log.warning("[YTPlaylist] Safe Skip: Video %d/%d is private/deleted/unavailable", index, total)
+                if progress_callback:
+                    progress_callback(playlist_name, total, index, f"Skipped: {video_title}", track_status="Skipped (Unavailable)")
+                continue
+
+            track_dir = playlist_dir / f"_tmp_yt_playlist_{index}"
+            track_dir.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # Direct download without Spotify lookups
+                info = download_audio_and_thumbnail(video_url, track_dir)
+                source_audio = find_downloaded_audio(track_dir)
+                if source_audio is None:
+                    raise ConversionError("The audio file was not downloaded.")
+                
+                title, artist = get_youtube_track_metadata(info, video_title)
+                
+                # Rule 2: Cover art fallback safety
+                cover_path = None
+                try:
+                    _log.info("[YTPlaylist] EMBEDDING ORIGINAL THUMBNAIL")
+                    cover_path = find_thumbnail(track_dir)
+                    if not cover_path:
+                        image_exts = {".jpg", ".jpeg", ".png", ".webp"}
+                        candidates = [p for p in track_dir.iterdir() if p.suffix.lower() in image_exts]
+                        cover_path = candidates[0] if candidates else None
+                except Exception as thumb_err:
+                    _log.warning("[YTPlaylist] Thumbnail check failed: %s (continuing download anyway)", thumb_err)
+
+                file_name = safe_filename(f"{index:02d} - {title}")
+                mp3_path = playlist_dir / f"{file_name}.mp3"
+                
+                convert_audio_to_mp3(source_audio, mp3_path, bitrate="320k")
+                
+                # Rule 2 fallback: if tagging with cover fails, retry tagging without it
+                try:
+                    add_mp3_metadata(mp3_path, title=title, artist=artist, cover_path=cover_path, album="YouTube Playlist")
+                except Exception as tag_err:
+                    _log.warning("[YTPlaylist] Cover embedding failed, retrying without cover art: %s", tag_err)
+                    try:
+                        add_mp3_metadata(mp3_path, title=title, artist=artist, cover_path=None, album="YouTube Playlist")
+                    except Exception:
+                        pass
+                
+                success_count += 1
+                if progress_callback:
+                    progress_callback(playlist_name, total, index, f"Completed: {video_title}", track_status="Completed")
+            except Exception as e:
+                # Rule 4: safe skip private/deleted/unavailable videos
+                _log.warning("[YTPlaylist] Video %d/%d failed/unavailable, skipping safely: %s", index, total, e)
+                if progress_callback:
+                    progress_callback(playlist_name, total, index, f"Skipped: {video_title}", track_status="Skipped (Unavailable)")
+            finally:
+                shutil.rmtree(track_dir, ignore_errors=True)
+
+        # Rule 1: ZIP creation success threshold (60%)
+        required_success = int(total * 0.6)
+        if success_count < required_success:
+            _log.error("[YTPlaylist] Success count %d/%d is below the 60%% threshold (%d required)", success_count, total, required_success)
+            raise ConversionError(f"Playlist download failed: Only {success_count} of {total} tracks converted successfully, which is below the 60% threshold.")
+
+        # Rule 3: Unique ZIP name timestamp protection
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        unique_zip_name = f"{playlist_name}_{timestamp}.zip"
+        zip_path = work_dir / unique_zip_name
+        
+        _log.info("[YTPlaylist] ZIP CREATED: %s", unique_zip_name)
+        create_zip_file(playlist_dir, zip_path)
+        
+        _log.info("[YTPlaylist] PLAYLIST DOWNLOAD COMPLETE")
+        return ConversionResult(
+            file_path=zip_path,
+            download_name=unique_zip_name,
+            work_dir=work_dir,
+        )
+    except Exception as exc:
+        shutil.rmtree(work_dir, ignore_errors=True)
+        if isinstance(exc, ConversionError):
+            raise exc
+        raise ConversionError(f"YouTube Playlist download failed: {exc}") from exc

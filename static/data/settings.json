@@ -1,0 +1,11 @@
+{
+  "audio_quality": "320",
+  "video_quality": "720",
+  "simultaneous_downloads": 1,
+  "download_folder": "",
+  "embed_metadata": true,
+  "embed_cover_art": true,
+  "zip_compression_level": 6,
+  "wifi_only": false,
+  "auto_clear_cache": false
+}

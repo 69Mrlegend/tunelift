@@ -32,6 +32,13 @@ from converter import (
 from utils.bulk import BulkInputError, bulk_tracks_response, parse_song_names
 from utils.converter import get_ffmpeg_path
 from utils.downloader import DownloadFailed, get_search_preview, get_video_preview
+from utils.local_store import (
+    DEFAULT_SETTINGS,
+    JsonStore,
+    cleanup_storage,
+    media_library,
+    storage_report,
+)
 from utils.spotify import (
     SpotifyError,
     get_spotify_playlist_info,
@@ -49,6 +56,10 @@ from utils.spotify import (
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
+DATA_DIR = BASE_DIR / "static" / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+settings_store = JsonStore(DATA_DIR / "settings.json", DEFAULT_SETTINGS)
+playlist_store = JsonStore(DATA_DIR / "local_playlists.json", {"playlists": []})
 VIDEO_QUALITIES = {"360", "720", "1080"}
 PLAYLIST_JOBS = {}
 BULK_JOBS = {}
@@ -67,6 +78,10 @@ app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 logging.basicConfig(level=logging.INFO)
 app.logger.setLevel(logging.INFO)
 logging.getLogger("utils.spotify").setLevel(logging.INFO)
+
+from utils.queue_manager import QueueManager
+db_path = DOWNLOAD_DIR / "history.db"
+queue_manager = QueueManager(db_path, DOWNLOAD_DIR)
 
 
 def playlist_json(payload, status=200, context="spotify-playlist"):
@@ -202,15 +217,20 @@ def index():
             result = convert_youtube_to_ipod_mp4(url, DOWNLOAD_DIR)
             mimetype = "video/mp4"
         else:
-            # MP3 mode: direct YouTube URL or song name search.
-            # These are mutually exclusive paths — a direct URL NEVER triggers
-            # the search logic, and a plain text query NEVER triggers direct download.
+            # MP3 mode: direct YouTube URL → fast direct download (NO Spotify).
+            #           plain text query  → Spotify-enriched search download.
+            # These are mutually exclusive — a direct URL NEVER enters the
+            # search path, and a plain text query NEVER enters the direct path.
             is_yt_url, _ = validate_youtube_url(url)
             if is_yt_url:
-                app.logger.info("mp3.download mode=direct_url url=%r", url)
+                app.logger.info(
+                    "[MP3] mode=direct_url — Spotify SKIPPED — url=%r", url
+                )
                 result = convert_youtube_to_mp3(url, DOWNLOAD_DIR)
             else:
-                app.logger.info("mp3.download mode=search query=%r", url)
+                app.logger.info(
+                    "[MP3] mode=search — Spotify enrichment ENABLED — query=%r", url
+                )
                 result = convert_search_to_mp3(url, DOWNLOAD_DIR)
             mimetype = "audio/mpeg"
 
@@ -293,9 +313,6 @@ def start_video_download():
         if not is_valid_url:
             return api_json({"ok": False, "message": error_message}, 400, "video.start")
 
-        if quality not in VIDEO_QUALITIES:
-            return api_json({"ok": False, "message": "Please choose a valid video quality."}, 400, "video.start")
-
         if get_ffmpeg_path() is None:
             return api_json(
                 {"ok": False, "message": FFMPEG_MISSING_MESSAGE},
@@ -303,11 +320,24 @@ def start_video_download():
                 "video.start",
             )
 
-        job_id = uuid.uuid4().hex
-        VIDEO_JOBS[job_id] = build_video_job(url, quality)
-
-        thread = threading.Thread(target=run_video_job, args=(job_id,), daemon=True)
-        thread.start()
+        # Enqueue via queue_manager!
+        queue_job_id = queue_manager.add_job(
+            "MP4",
+            url,
+            quality=quality,
+            title="MP4 Video"
+        )
+        
+        # Retrofit: Store a reference inside VIDEO_JOBS mapped to the original job_id
+        job_id = queue_job_id
+        VIDEO_JOBS[job_id] = queue_manager.jobs[queue_job_id]
+        
+        # Inject backwards compatibility fields for original pollers
+        VIDEO_JOBS[job_id]["video_title"] = "MP4 Video"
+        VIDEO_JOBS[job_id]["download_url"] = f"/api/queue/download/{queue_job_id}"
+        VIDEO_JOBS[job_id]["status_label"] = "Queued"
+        VIDEO_JOBS[job_id]["downloaded"] = ""
+        VIDEO_JOBS[job_id]["total_size"] = ""
 
         return api_json({"ok": True, "job_id": job_id}, context="video.start")
     except Exception as exc:
@@ -382,11 +412,23 @@ def start_ipod_download():
                 "ipod.start",
             )
 
-        job_id = uuid.uuid4().hex
-        IPOD_JOBS[job_id] = build_video_job(url, "iPod 480x320")
-
-        thread = threading.Thread(target=run_ipod_job, args=(job_id,), daemon=True)
-        thread.start()
+        # Enqueue via queue_manager!
+        queue_job_id = queue_manager.add_job(
+            "iPod",
+            url,
+            quality="480",
+            title="iPod Video"
+        )
+        
+        job_id = queue_job_id
+        IPOD_JOBS[job_id] = queue_manager.jobs[queue_job_id]
+        
+        # Inject backward compatibility fields
+        IPOD_JOBS[job_id]["video_title"] = "iPod Video"
+        IPOD_JOBS[job_id]["download_url"] = f"/api/queue/download/{queue_job_id}"
+        IPOD_JOBS[job_id]["status_label"] = "Queued"
+        IPOD_JOBS[job_id]["downloaded"] = ""
+        IPOD_JOBS[job_id]["total_size"] = ""
 
         return api_json({"ok": True, "job_id": job_id}, context="ipod.start")
     except Exception as exc:
@@ -703,10 +745,22 @@ def start_spotify_playlist():
                 "spotify-playlist.start",
             )
 
-        job["status"] = "queued"
-        job["message"] = "Download queued"
-        thread = threading.Thread(target=run_spotify_playlist_job, args=(job_id,), daemon=True)
-        thread.start()
+        # Enqueue via queue_manager!
+        queue_job_id = queue_manager.add_job(
+            "Spotify",
+            job["url"],
+            title=job["playlist_name"],
+            thumbnail=job.get("playlist_thumbnail") or "",
+            tracks=job.get("tracks") or []
+        )
+        
+        # Map the original job_id to this new enqueued queue job!
+        PLAYLIST_JOBS[job_id] = queue_manager.jobs[queue_job_id]
+        
+        # Inject backwards compatibility fields
+        PLAYLIST_JOBS[job_id]["download_url"] = f"/api/queue/download/{queue_job_id}"
+        PLAYLIST_JOBS[job_id]["current"] = 0
+        PLAYLIST_JOBS[job_id]["error"] = ""
 
         return playlist_json({"ok": True, "job_id": job_id}, context="spotify-playlist.start")
     except Exception as exc:
@@ -724,14 +778,14 @@ def spotify_playlist_progress(job_id):
         return playlist_json(
             {
             "ok": True,
-            "status": job["status"],
-            "playlist_name": job["playlist_name"],
-            "playlist_thumbnail": job.get("playlist_thumbnail", ""),
-            "current": job["current"],
-            "total": job["total"],
-            "message": job["message"],
-            "download_url": job["download_url"],
-            "error": job["error"],
+            "status": job.get("status", "Pending"),
+            "playlist_name": job.get("playlist_name") or job.get("title") or "Untitled Playlist",
+            "playlist_thumbnail": job.get("playlist_thumbnail") or job.get("thumbnail") or "",
+            "current": job.get("current", 0),
+            "total": job.get("total", len(job.get("tracks", []))),
+            "message": job.get("message") or "",
+            "download_url": job.get("download_url") or "",
+            "error": job.get("error") or "",
             "tracks": job.get("tracks", []),
             "active_index": job.get("active_index"),
             },
@@ -925,6 +979,107 @@ def prepare_spotify_playlist():
         return playlist_json({"ok": False, "message": f"Unexpected playlist prepare error: {exc}"}, 500, "spotify-playlist.prepare")
 
 
+@app.post("/api/youtube-playlist/prepare")
+def prepare_youtube_playlist():
+    try:
+        url = request.form.get("url", "").strip()
+        if not url:
+            return jsonify({"ok": False, "message": "Please paste a valid YouTube playlist link."}), 400
+        
+        # Extract playlist information via yt-dlp flat-extract
+        import yt_dlp
+        ydl_opts = {
+            'extract_flat': 'in_playlist',
+            'skip_download': True,
+            'quiet': True,
+            'no_warnings': True,
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            
+        if not info:
+            return jsonify({"ok": False, "message": "Could not fetch YouTube playlist details."}), 400
+            
+        entries = [e for e in info.get("entries", []) if e]
+        total = len(entries)
+        
+        # Rule 5: playlist size limit
+        if total > 200:
+            return jsonify({"ok": False, "message": "Playlist too large. Maximum supported: 200 videos."}), 400
+            
+        tracks = []
+        for index, entry in enumerate(entries, start=1):
+            tracks.append({
+                "title": entry.get("title") or f"YouTube Video {index}",
+                "artist": "YouTube Video",
+                "thumbnail": entry.get("thumbnail") or "",
+                "status": "Pending",
+                "url": f"https://www.youtube.com/watch?v={entry.get('id')}" if entry.get('id') else entry.get('url') or ""
+            })
+            
+        job_id = uuid.uuid4().hex
+        PLAYLIST_JOBS[job_id] = {
+            "status": "prepared",
+            "playlist_name": info.get("title") or "YouTube Playlist",
+            "playlist_thumbnail": info.get("thumbnail") or (tracks[0]["thumbnail"] if tracks else ""),
+            "current": 0,
+            "total": total,
+            "message": "Ready to download",
+            "tracks": tracks,
+            "url": url,
+            "type": "YouTube Playlist",
+            "download_url": "",
+            "error": ""
+        }
+        
+        app.logger.info("youtube-playlist.prepare created job_id=%r playlist=%r total=%d", job_id, PLAYLIST_JOBS[job_id]["playlist_name"], total)
+        return jsonify({
+            "ok": True,
+            "job_id": job_id,
+            "playlist": {
+                "name": PLAYLIST_JOBS[job_id]["playlist_name"],
+                "thumbnail": PLAYLIST_JOBS[job_id]["playlist_thumbnail"],
+                "total": total,
+                "tracks": tracks
+            }
+        })
+    except Exception as e:
+        app.logger.exception("youtube-playlist.prepare error")
+        return jsonify({"ok": False, "message": f"Could not load playlist details: {e}"}), 500
+
+
+@app.post("/api/youtube-playlist/start")
+def start_youtube_playlist():
+    try:
+        job_id = request.form.get("job_id", "").strip()
+        job = PLAYLIST_JOBS.get(job_id)
+        if not job:
+            return jsonify({"ok": False, "message": "Playlist details must be loaded before download starts."}), 400
+            
+        if job["status"] != "prepared":
+            return jsonify({"ok": False, "message": "This playlist download has already started."}), 400
+            
+        # Enqueue in queue manager
+        queue_job_id = queue_manager.add_job(
+            "YouTube Playlist",
+            job["url"],
+            title=job["playlist_name"],
+            thumbnail=job.get("playlist_thumbnail") or "",
+            tracks=job.get("tracks") or []
+        )
+        
+        # Sync mappings
+        PLAYLIST_JOBS[job_id] = queue_manager.jobs[queue_job_id]
+        PLAYLIST_JOBS[job_id]["download_url"] = f"/api/queue/download/{queue_job_id}"
+        PLAYLIST_JOBS[job_id]["current"] = 0
+        PLAYLIST_JOBS[job_id]["error"] = ""
+        
+        return jsonify({"ok": True, "job_id": job_id})
+    except Exception as e:
+        app.logger.exception("youtube-playlist.start error")
+        return jsonify({"ok": False, "message": f"Unexpected playlist start error: {e}"}), 500
+
+
 def build_prepared_playlist_job(url, playlist):
     tracks = playlist_tracks_response(playlist)
 
@@ -1009,12 +1164,22 @@ def start_bulk_download():
                 "bulk.start",
             )
 
-        job_id = uuid.uuid4().hex
-        BULK_JOBS[job_id] = build_bulk_job(song_names)
-        app.logger.info("bulk.start created_job job_id=%r total=%s", job_id, len(song_names))
-
-        thread = threading.Thread(target=run_bulk_job, args=(job_id,), daemon=True)
-        thread.start()
+        # Enqueue via queue_manager!
+        queue_job_id = queue_manager.add_job(
+            "Bulk",
+            song_names,
+            title="Bulk Songs",
+            tracks=bulk_tracks_response(song_names)
+        )
+        
+        job_id = queue_job_id
+        BULK_JOBS[job_id] = queue_manager.jobs[queue_job_id]
+        
+        # Inject backwards compatibility fields
+        BULK_JOBS[job_id]["collection_name"] = "Bulk Songs"
+        BULK_JOBS[job_id]["download_url"] = f"/api/queue/download/{queue_job_id}"
+        BULK_JOBS[job_id]["current"] = 0
+        BULK_JOBS[job_id]["error"] = ""
 
         payload = {
             "ok": True,
@@ -1184,6 +1349,284 @@ def cleanup_bulk_job(job_id):
         shutil.rmtree(job["result"].work_dir, ignore_errors=True)
 
 
+@app.post("/api/queue/add")
+def api_queue_add():
+    try:
+        url = request.form.get("url", "").strip()
+        download_type = request.form.get("download_type", "mp3")
+        quality = request.form.get("quality", "720")
+        confirmed_youtube_url = request.form.get("confirmed_youtube_url", "").strip()
+        
+        if not url:
+            return jsonify({"ok": False, "message": "Paste a link first."}), 400
+            
+        if download_type == "spotify":
+            if not is_spotify_url(url):
+                return jsonify({"ok": False, "message": "Please paste a valid Spotify link."}), 400
+            
+            # Resolve track metadata immediately for a single track
+            if get_spotify_url_type(url) == "track":
+                try:
+                    track_info = get_spotify_track_info(url)
+                    job_id = queue_manager.add_job(
+                        "Spotify",
+                        url,
+                        title=track_info["title"],
+                        artist=track_info["artist"],
+                        thumbnail=track_info["thumbnail"]
+                    )
+                    return jsonify({"ok": True, "job_id": job_id})
+                except Exception as e:
+                    return jsonify({"ok": False, "message": f"Failed to get Spotify track metadata: {e}"}), 400
+            else:
+                return jsonify({"ok": False, "message": "Playlists should be downloaded via the playlist flow."}), 400
+                
+        elif download_type == "mp3":
+            # Direct YouTube MP3 or YouTube Search MP3
+            is_yt, _ = validate_youtube_url(url)
+            title = "YouTube Audio"
+            if is_yt:
+                title = url
+            else:
+                title = url
+                
+            job_id = queue_manager.add_job(
+                "MP3",
+                url,
+                title=title
+            )
+            return jsonify({"ok": True, "job_id": job_id})
+            
+        elif download_type in ["mp4", "ipod"]:
+            is_valid, err = validate_youtube_url(url)
+            if not is_valid:
+                return jsonify({"ok": False, "message": err}), 400
+                
+            job_id = queue_manager.add_job(
+                "iPod" if download_type == "ipod" else "MP4",
+                url,
+                quality=quality,
+                title=url
+            )
+            return jsonify({"ok": True, "job_id": job_id})
+            
+        else:
+            return jsonify({"ok": False, "message": "Invalid download type."}), 400
+            
+    except Exception as e:
+        app.logger.exception("api_queue_add error")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/queue/poll")
+def api_queue_poll():
+    try:
+        status = queue_manager.get_queue_status()
+        return jsonify({
+            "ok": True,
+            "active": status["active"],
+            "history": status["history"],
+            "current_job_id": status["current_job_id"],
+            "queue_paused": status.get("queue_paused", False),
+        })
+    except Exception as e:
+        app.logger.exception("api_queue_poll error")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/queue/stop/<job_id>")
+def api_queue_stop(job_id):
+    try:
+        success = queue_manager.stop_job(job_id)
+        if success:
+            return jsonify({"ok": True})
+        else:
+            return jsonify({"ok": False, "message": "Job not found."}), 404
+    except Exception as e:
+        app.logger.exception("api_queue_stop error")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.post("/api/queue/pause")
+def api_queue_pause_all():
+    queue_manager.pause_queue()
+    return jsonify({"ok": True, "message": "Queue paused"})
+
+
+@app.post("/api/queue/resume")
+def api_queue_resume_all():
+    queue_manager.resume_queue()
+    return jsonify({"ok": True, "message": "Queue resumed"})
+
+
+@app.post("/api/queue/pause/<job_id>")
+def api_queue_pause(job_id):
+    if queue_manager.pause_job(job_id):
+        return jsonify({"ok": True, "message": "Download paused"})
+    return jsonify({"ok": False, "message": "Job not found."}), 404
+
+
+@app.post("/api/queue/resume/<job_id>")
+def api_queue_resume(job_id):
+    if queue_manager.resume_job(job_id):
+        return jsonify({"ok": True, "message": "Download resumed"})
+    return jsonify({"ok": False, "message": "Job not found."}), 404
+
+
+@app.post("/api/queue/cancel/<job_id>")
+def api_queue_cancel(job_id):
+    if queue_manager.cancel_job(job_id):
+        return jsonify({"ok": True, "message": "Download canceled"})
+    return jsonify({"ok": False, "message": "Job not found."}), 404
+
+
+@app.post("/api/history/delete/<job_id>")
+def api_history_delete(job_id):
+    queue_manager.delete_history_item(job_id)
+    return jsonify({"ok": True})
+
+
+@app.post("/api/history/clear")
+def api_history_clear():
+    queue_manager.clear_history()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/queue/retry/<job_id>")
+def api_queue_retry(job_id):
+    try:
+        success = queue_manager.retry_job(job_id)
+        if success:
+            return jsonify({"ok": True})
+        else:
+            return jsonify({"ok": False, "message": "Job not found."}), 404
+    except Exception as e:
+        app.logger.exception("api_queue_retry error")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
+@app.get("/api/player/library")
+def api_player_library():
+    return jsonify({"ok": True, "songs": media_library(DOWNLOAD_DIR)})
+
+
+@app.get("/api/player/file")
+def api_player_file():
+    raw_path = request.args.get("path", "")
+    try:
+        requested = Path(raw_path).resolve()
+        root = DOWNLOAD_DIR.resolve()
+        if requested.suffix.lower() != ".mp3" or not requested.exists() or root not in requested.parents:
+            return jsonify({"ok": False, "message": "Audio file not found."}), 404
+        return send_file(requested, mimetype="audio/mpeg", conditional=True)
+    except Exception as exc:
+        app.logger.exception("api_player_file error")
+        return jsonify({"ok": False, "message": str(exc)}), 500
+
+
+@app.get("/api/local-playlists")
+def api_local_playlists_get():
+    return jsonify({"ok": True, **playlist_store.read()})
+
+
+@app.post("/api/local-playlists")
+def api_local_playlists_save():
+    payload = request.get_json(silent=True) or {}
+    playlists = payload.get("playlists")
+    if not isinstance(playlists, list):
+        return jsonify({"ok": False, "message": "Invalid playlists payload."}), 400
+    playlist_store.write({"playlists": playlists})
+    return jsonify({"ok": True, "playlists": playlists})
+
+
+@app.get("/api/settings")
+def api_settings_get():
+    settings = DEFAULT_SETTINGS.copy()
+    settings.update(settings_store.read())
+    if not settings.get("download_folder"):
+        settings["download_folder"] = str(DOWNLOAD_DIR)
+    return jsonify({"ok": True, "settings": settings})
+
+
+@app.post("/api/settings")
+def api_settings_save():
+    payload = request.get_json(silent=True) or {}
+    current = DEFAULT_SETTINGS.copy()
+    current.update(settings_store.read())
+    for key in DEFAULT_SETTINGS:
+        if key in payload:
+            current[key] = payload[key]
+    settings_store.write(current)
+    return jsonify({"ok": True, "settings": current})
+
+
+@app.get("/api/storage")
+def api_storage_get():
+    return jsonify({"ok": True, **storage_report(DOWNLOAD_DIR)})
+
+
+@app.post("/api/storage/cleanup")
+def api_storage_cleanup():
+    payload = request.get_json(silent=True) or {}
+    removed = cleanup_storage(DOWNLOAD_DIR, remove_duplicates=bool(payload.get("remove_duplicates")))
+    return jsonify({"ok": True, "removed": removed, **storage_report(DOWNLOAD_DIR)})
+
+
+@app.get("/api/analytics")
+def api_analytics():
+    status = queue_manager.get_queue_status()
+    jobs = status["history"] + status["active"]
+    completed = [job for job in jobs if job.get("status") == "Completed"]
+    type_counts = {}
+    for job in completed:
+        type_counts[job.get("type") or "Unknown"] = type_counts.get(job.get("type") or "Unknown", 0) + 1
+    most_downloaded = max(type_counts, key=type_counts.get) if type_counts else "None"
+    storage = storage_report(DOWNLOAD_DIR)
+    return jsonify({
+        "ok": True,
+        "total_songs": sum(1 for job in completed if job.get("type") in ["MP3", "Spotify"]),
+        "total_playlists": sum(1 for job in completed if job.get("type") in ["Bulk", "Spotify", "YouTube Playlist"]),
+        "storage_used": storage["downloads_size"],
+        "most_downloaded_type": most_downloaded,
+        "average_speed": "Live",
+        "queue_statistics": {
+            "active": len(status["active"]),
+            "history": len(status["history"]),
+            "completed": len(completed),
+            "failed": sum(1 for job in jobs if job.get("status") == "Failed"),
+        },
+    })
+
+
+@app.get("/api/queue/download/<job_id>")
+def api_queue_download(job_id):
+    try:
+        job = queue_manager.jobs.get(job_id)
+        if not job or job.get("status") != "Completed" or not job.get("saved_location"):
+            return jsonify({"ok": False, "message": "File not found or not completed."}), 404
+            
+        saved_location = job["saved_location"]
+        download_name = job["download_name"] or os.path.basename(saved_location)
+        
+        if not os.path.exists(saved_location):
+            return jsonify({"ok": False, "message": "File does not exist on disk."}), 404
+            
+        mimetype = "audio/mpeg"
+        if job["type"] in ["MP4", "iPod"]:
+            mimetype = "video/mp4"
+        elif job["type"] in ["Bulk", "Spotify", "YouTube Playlist"] and saved_location.endswith(".zip"):
+            mimetype = "application/zip"
+            
+        return send_file(
+            saved_location,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype=mimetype
+        )
+    except Exception as e:
+        app.logger.exception("api_queue_download error")
+        return jsonify({"ok": False, "message": str(e)}), 500
+
+
 if __name__ == "__main__":
     app.run(debug=True)
-    
