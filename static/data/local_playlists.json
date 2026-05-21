@@ -1,3 +1,9 @@
 {
-  "playlists": []
+  "playlists": [
+    {
+      "id": "1779208687007",
+      "name": "New Playlist",
+      "songs": []
+    }
+  ]
 }
